@@ -212,7 +212,7 @@ The agent demonstrates: HTTP beaconing, command execution, file transfer, jitter
 
 ## Why This Exists
 
-**12 months of attempted responsible disclosure. Zero meaningful responses.**
+**12 months of attempted responsible disclosure.**
 
 The security industry evaluated this capability and chose silence over engagement.
 
