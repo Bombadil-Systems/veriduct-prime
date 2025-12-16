@@ -1,0 +1,31 @@
+# Veriduct Prime Dependencies
+
+# Required (core functionality)
+# Note: All core functionality uses Python standard library
+# These are optional but recommended
+
+# Compression (recommended, falls back to zlib if not available)
+zstandard>=0.19.0
+
+# Testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
+
+# Development
+black>=23.0.0
+isort>=5.12.0
+mypy>=1.0.0
+
+# GUI (optional, for veriduct_gui_final.py)
+# tkinter is included with Python on most systems
+# If missing on Linux: sudo apt-get install python3-tk
+
+# Documentation
+# No external dependencies required
+
+# C2 Server (optional, uses standard library)
+# No external dependencies required
+
+# C2 Agent (C compilation)
+# Windows: Visual Studio Build Tools or MinGW
+# Linux: gcc and libcurl-dev
