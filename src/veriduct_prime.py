@@ -45,6 +45,7 @@ import struct
 import ctypes
 import platform
 from typing import List, Tuple, Dict, Optional, Iterator
+from ctypes import wintypes
 
 # ==============================================================================
 # Compression Layer
@@ -91,6 +92,162 @@ PAGE_EXECUTE_READWRITE = 0x40
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
 IMAGE_SCN_MEM_READ = 0x40000000
 IMAGE_SCN_MEM_WRITE = 0x80000000
+
+# PEB Structures for CRT initialization
+class UNICODE_STRING(ctypes.Structure):
+    _fields_ = [
+        ("Length", wintypes.USHORT),
+        ("MaximumLength", wintypes.USHORT),
+        ("Buffer", wintypes.LPWSTR),
+    ]
+
+class LIST_ENTRY(ctypes.Structure):
+    pass
+LIST_ENTRY._fields_ = [
+    ("Flink", ctypes.POINTER(LIST_ENTRY)),
+    ("Blink", ctypes.POINTER(LIST_ENTRY)),
+]
+
+class PEB_LDR_DATA(ctypes.Structure):
+    _fields_ = [
+        ("Length", wintypes.ULONG),
+        ("Initialized", wintypes.BOOLEAN),
+        ("SsHandle", wintypes.HANDLE),
+        ("InLoadOrderModuleList", LIST_ENTRY),
+        ("InMemoryOrderModuleList", LIST_ENTRY),
+        ("InInitializationOrderModuleList", LIST_ENTRY),
+    ]
+
+class CURDIR(ctypes.Structure):
+    _fields_ = [
+        ("DosPath", UNICODE_STRING),
+        ("Handle", wintypes.HANDLE),
+    ]
+
+class RTL_USER_PROCESS_PARAMETERS(ctypes.Structure):
+    _fields_ = [
+        ("MaximumLength", wintypes.ULONG),
+        ("Length", wintypes.ULONG),
+        ("Flags", wintypes.ULONG),
+        ("DebugFlags", wintypes.ULONG),
+        ("ConsoleHandle", wintypes.HANDLE),
+        ("ConsoleFlags", wintypes.ULONG),
+        ("StandardInput", wintypes.HANDLE),
+        ("StandardOutput", wintypes.HANDLE),
+        ("StandardError", wintypes.HANDLE),
+        ("CurrentDirectory", CURDIR),
+        ("DllPath", UNICODE_STRING),
+        ("ImagePathName", UNICODE_STRING),
+        ("CommandLine", UNICODE_STRING),
+    ]
+
+class PEB(ctypes.Structure):
+    _fields_ = [
+        ("InheritedAddressSpace", wintypes.BOOLEAN),
+        ("ReadImageFileExecOptions", wintypes.BOOLEAN),
+        ("BeingDebugged", wintypes.BOOLEAN),
+        ("BitField", wintypes.BYTE),
+        ("Padding0", wintypes.BYTE * 4),
+        ("Mutant", wintypes.HANDLE),
+        ("ImageBaseAddress", wintypes.LPVOID),
+        ("Ldr", ctypes.POINTER(PEB_LDR_DATA)),
+        ("ProcessParameters", ctypes.POINTER(RTL_USER_PROCESS_PARAMETERS)),
+    ]
+
+class PROCESS_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("Reserved1", wintypes.LPVOID),
+        ("PebBaseAddress", ctypes.POINTER(PEB)),
+        ("Reserved2", wintypes.LPVOID * 2),
+        ("UniqueProcessId", ctypes.POINTER(wintypes.ULONG)),
+        ("Reserved3", wintypes.LPVOID),
+    ]
+
+class CRTInitializer:
+    def __init__(self, base_addr, stream, is_64bit, load_config_rva=0, load_config_size=0):
+        self.base_addr = base_addr
+        self.stream = stream
+        self.is_64bit = is_64bit
+        self.load_config_rva = load_config_rva
+        self.load_config_size = load_config_size
+        self.peb_ptr = None
+        self.orig_image_base = None
+        
+    def _get_peb(self):
+        if self.peb_ptr is not None:
+            return self.peb_ptr
+        ntdll = ctypes.windll.ntdll
+        kernel32 = ctypes.windll.kernel32
+        pbi = PROCESS_BASIC_INFORMATION()
+        ret_len = wintypes.ULONG()
+        status = ntdll.NtQueryInformationProcess(
+            kernel32.GetCurrentProcess(), 0, ctypes.byref(pbi),
+            ctypes.sizeof(pbi), ctypes.byref(ret_len))
+        if status != 0:
+            raise RuntimeError(f"NtQueryInformationProcess failed: {status}")
+        self.peb_ptr = pbi.PebBaseAddress
+        return self.peb_ptr
+    
+    def initialize(self):
+        logging.info("Initializing CRT environment...")
+        self._init_security_cookie()
+        self._patch_peb()
+        logging.info("CRT initialization complete")
+    
+    def _patch_peb(self):
+        try:
+            peb = self._get_peb()
+            self.orig_image_base = peb.contents.ImageBaseAddress
+            peb.contents.ImageBaseAddress = ctypes.c_void_p(self.base_addr)
+            logging.debug(f"PEB.ImageBaseAddress patched to 0x{self.base_addr:X}")
+        except Exception as e:
+            logging.warning(f"Failed to patch PEB: {e}")
+    
+    def _init_security_cookie(self):
+        if self.load_config_rva == 0:
+            logging.warning("No Load Config RVA found. Skipping cookie init.")
+            return
+        try:
+            # CRITICAL FIX: 
+            # On x64, SecurityCookie is at offset 0x58 (88), NOT 0x60.
+            # On x86, SecurityCookie is at offset 0x3C (60).
+            cookie_ptr_offset = 0x58 if self.is_64bit else 0x3C
+            
+            required_size = cookie_ptr_offset + (8 if self.is_64bit else 4)
+            if self.load_config_size < required_size:
+                logging.warning(f"Load Config too small for cookie (Size: {self.load_config_size})")
+                return
+                
+            load_config_va = self.base_addr + self.load_config_rva
+            cookie_va_addr = load_config_va + cookie_ptr_offset
+            
+            if self.is_64bit:
+                cookie_va = ctypes.c_uint64.from_address(cookie_va_addr).value
+            else:
+                cookie_va = ctypes.c_uint32.from_address(cookie_va_addr).value
+                
+            if cookie_va == 0:
+                logging.warning("Security Cookie VA is NULL. Skipping.")
+                return
+                
+            # Generate and write random cookie
+            if self.is_64bit:
+                new_cookie = random.randint(0x0000FFFF00000000, 0x0000FFFFFFFFFFFF)
+                ctypes.c_uint64.from_address(cookie_va).value = new_cookie
+            else:
+                new_cookie = random.randint(0x0000FFFF, 0x7FFFFFFF)
+                ctypes.c_uint32.from_address(cookie_va).value = new_cookie
+                
+            logging.info(f"Security cookie at 0x{cookie_va:X} set to 0x{new_cookie:X}")
+        except Exception as e:
+            logging.error(f"Failed to init security cookie: {e}")
+    
+    def restore(self):
+        if self.orig_image_base is not None and self.peb_ptr is not None:
+            try:
+                self.peb_ptr.contents.ImageBaseAddress = self.orig_image_base
+            except:
+                pass
 
 # ==============================================================================
 # Memory Substrate - Fileless Execution Framework
@@ -423,7 +580,10 @@ class VeriductNativeLoader:
         self.image_base = 0
         self.mapped_memory = None
         self.mapped_size = 0
-        
+        self.is_64bit = False
+        self.load_config_rva = 0
+        self.load_config_size = 0
+
     def parse_headers(self):
         """Identifies file type and parses structures."""
         if len(self.stream) < 64:
@@ -522,6 +682,13 @@ class VeriductNativeLoader:
                 self.tls_directory_rva = tls_rva
                 logging.debug(f"TLS Directory found at RVA 0x{tls_rva:X}")
 
+            # Load Config Directory (Index 10)
+            self.load_config_rva = struct.unpack('<I', self.stream[dd_offset+80:dd_offset+84])[0]
+            self.load_config_size = struct.unpack('<I', self.stream[dd_offset+84:dd_offset+88])[0]
+            
+            # Store is_64bit
+            self.is_64bit = is_64bit
+
             # Section headers offset
             self.section_header_offset = opt_header_offset + opt_header_size
             self.is_valid = True
@@ -574,6 +741,10 @@ class VeriductNativeLoader:
     
             base_addr_int = base_addr if isinstance(base_addr, int) else ctypes.cast(base_addr, ctypes.c_void_p).value
             logging.info(f"Allocated {self.size_of_image} bytes at 0x{base_addr_int:X}")
+
+            # Initialize CRT helper
+            crt_init = CRTInitializer(base_addr_int, self.stream, self.is_64bit, 
+                                    self.load_config_rva, self.load_config_size)
     
             try:
                 sections_to_protect = []
@@ -641,6 +812,8 @@ class VeriductNativeLoader:
                             ctypes.byref(old_protect)
                         )
         
+                # CRT Initialization
+                crt_init.initialize()
                 # Execute
                 entry_addr = base_addr_int + self.entry_point_rva
                 logging.info(f"Jumping to entry point: 0x{entry_addr:X}")
@@ -690,10 +863,12 @@ class VeriductNativeLoader:
                         import traceback
                         traceback.print_exc()
                         raise
-                        
+
+                crt_init.restore()        
                 return result
             
             except Exception as e:
+                crt_init.restore()
                 kernel32.VirtualFree(base_addr, 0, 0x8000)  # MEM_RELEASE
                 logging.error(f"PE execution failed: {e}")
                 raise
