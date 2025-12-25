@@ -164,7 +164,7 @@ class PROCESS_BASIC_INFORMATION(ctypes.Structure):
     ]
 
 class CRTInitializer:
-    def __init__(self, base_addr, stream, is_64bit, load_config_rva=0, load_config_size=0):
+    def __init__(self, base_addr, stream, is_64bit, load_config_rva=0, load_config_size=0, command_line=None):
         self.base_addr = base_addr
         self.stream = stream
         self.is_64bit = is_64bit
@@ -172,6 +172,8 @@ class CRTInitializer:
         self.load_config_size = load_config_size
         self.peb_ptr = None
         self.orig_image_base = None
+        self.orig_command_line = None
+        self.command_line = command_line  # New: command line args to pass to PE
         
     def _get_peb(self):
         if self.peb_ptr is not None:
@@ -192,6 +194,7 @@ class CRTInitializer:
         logging.info("Initializing CRT environment...")
         self._init_security_cookie()
         self._patch_peb()
+        self._patch_command_line()
         logging.info("CRT initialization complete")
     
     def _patch_peb(self):
@@ -202,6 +205,39 @@ class CRTInitializer:
             logging.debug(f"PEB.ImageBaseAddress patched to 0x{self.base_addr:X}")
         except Exception as e:
             logging.warning(f"Failed to patch PEB: {e}")
+    
+    def _patch_command_line(self):
+        """Patch the command line in PEB.ProcessParameters."""
+        if not self.command_line:
+            return
+        try:
+            peb = self._get_peb()
+            params = peb.contents.ProcessParameters.contents
+            
+            # Save original
+            self.orig_command_line = (
+                params.CommandLine.Length,
+                params.CommandLine.MaximumLength,
+                params.CommandLine.Buffer
+            )
+            
+            # Create new command line string (wide chars)
+            cmd_wide = self.command_line
+            if not cmd_wide.endswith('\x00'):
+                cmd_wide += '\x00'
+            
+            # Allocate and set new command line
+            new_buffer = ctypes.create_unicode_buffer(cmd_wide)
+            params.CommandLine.Buffer = ctypes.cast(new_buffer, wintypes.LPWSTR)
+            params.CommandLine.Length = (len(self.command_line)) * 2  # Wide chars
+            params.CommandLine.MaximumLength = (len(cmd_wide)) * 2
+            
+            # Keep reference to prevent garbage collection
+            self._cmd_buffer = new_buffer
+            
+            logging.debug(f"CommandLine patched to: {self.command_line}")
+        except Exception as e:
+            logging.warning(f"Failed to patch CommandLine: {e}")
     
     def _init_security_cookie(self):
         if self.load_config_rva == 0:
@@ -572,7 +608,7 @@ class VeriductNativeLoader:
     Native binary loader for PE and ELF.
     Implements dynamic linking, relocation, and execution transfer in pure Python.
     """
-    def __init__(self, raw_data_stream: bytearray):
+    def __init__(self, raw_data_stream: bytearray, command_line: str = None):
         self.stream = raw_data_stream
         self.is_valid = False
         self.entry_point = 0
@@ -583,6 +619,7 @@ class VeriductNativeLoader:
         self.is_64bit = False
         self.load_config_rva = 0
         self.load_config_size = 0
+        self.command_line = command_line  # Command line to pass to PE
 
     def parse_headers(self):
         """Identifies file type and parses structures."""
@@ -596,6 +633,12 @@ class VeriductNativeLoader:
         elif self.stream[:2] == b'MZ':
             self.architecture = "PE"
             self._parse_pe()
+            pe_offset = struct.unpack('<I', self.stream[0x3C:0x40])[0]
+            print(f"PE offset: 0x{pe_offset:X}")
+            print(f"PE signature: {self.stream[pe_offset:pe_offset+4]}")
+            entry_rva = struct.unpack('<I', self.stream[pe_offset+40:pe_offset+44])[0]
+            print(f"Entry RVA from header: 0x{entry_rva:X}")
+            print(f"First 64 bytes at PE offset: {self.stream[pe_offset:pe_offset+64].hex()}")
         else:
             logging.error("Unknown executable format")
             self.is_valid = False
@@ -742,9 +785,10 @@ class VeriductNativeLoader:
             base_addr_int = base_addr if isinstance(base_addr, int) else ctypes.cast(base_addr, ctypes.c_void_p).value
             logging.info(f"Allocated {self.size_of_image} bytes at 0x{base_addr_int:X}")
 
-            # Initialize CRT helper
+            # Initialize CRT helper with command line
             crt_init = CRTInitializer(base_addr_int, self.stream, self.is_64bit, 
-                                    self.load_config_rva, self.load_config_size)
+                                    self.load_config_rva, self.load_config_size,
+                                    command_line=self.command_line)
     
             try:
                 sections_to_protect = []
@@ -844,32 +888,85 @@ class VeriductNativeLoader:
                         traceback.print_exc()
                         raise
                 else:
-                    logging.info("Detected EXE - calling with no arguments")
-                    # EXE entry point: int mainCRTStartup(void) or int WinMainCRTStartup(void)
-                    ENTRY_FUNC = ctypes.CFUNCTYPE(ctypes.c_int)
-                    entry = ENTRY_FUNC(entry_addr)
+                    logging.info("Detected EXE - running in isolated thread")
+                    # Run PE in separate thread so ExitThread (hooked from ExitProcess) 
+                    # only kills the PE thread, not our Python host
                     
-                    try:
-                        logging.info(f"Calling entry point at 0x{entry_addr:X}...")
-                        result = entry()  # No arguments for EXE
-                        logging.info(f"Entry point returned: {result}")
-                    except OSError as e:
-                        logging.error(f"Entry point crashed with OS error: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        raise
-                    except Exception as e:
-                        logging.error(f"Entry point crashed: {type(e).__name__}: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        raise
+                    LPTHREAD_START_ROUTINE = ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+                    
+                    # CreateThread parameters
+                    kernel32.CreateThread.argtypes = [
+                        ctypes.c_void_p,  # lpThreadAttributes
+                        ctypes.c_size_t,  # dwStackSize
+                        ctypes.c_void_p,  # lpStartAddress (entry point)
+                        ctypes.c_void_p,  # lpParameter
+                        ctypes.c_ulong,   # dwCreationFlags
+                        ctypes.POINTER(ctypes.c_ulong)  # lpThreadId
+                    ]
+                    kernel32.CreateThread.restype = ctypes.c_void_p
+                    
+                    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+                    kernel32.WaitForSingleObject.restype = ctypes.c_ulong
+                    
+                    kernel32.GetExitCodeThread.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+                    kernel32.GetExitCodeThread.restype = ctypes.c_int
+                    
+                    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+                    kernel32.CloseHandle.restype = ctypes.c_int
+                    
+                    INFINITE = 0xFFFFFFFF
+                    
+                    logging.info(f"Creating thread at entry point 0x{entry_addr:X}...")
+                    h_thread = kernel32.CreateThread(
+                        None,           # Default security
+                        0,              # Default stack size  
+                        entry_addr,     # Start at PE entry point
+                        None,           # No parameter
+                        0,              # Run immediately
+                        None            # Don't need thread ID
+                    )
+                    
+                    if not h_thread:
+                        raise OSError(f"CreateThread failed: {ctypes.get_last_error()}")
+                    
+                    logging.info(f"PE thread started, waiting for completion...")
+                    
+                    # Wait for PE to finish (will call ExitThread due to our hook)
+                    wait_result = kernel32.WaitForSingleObject(h_thread, INFINITE)
+                    
+                    # Get exit code
+                    exit_code = ctypes.c_ulong(0)
+                    kernel32.GetExitCodeThread(h_thread, ctypes.byref(exit_code))
+                    result = exit_code.value
+                    
+                    # Cleanup
+                    kernel32.CloseHandle(h_thread)
+                    
+                    logging.info(f"PE thread exited with code: {result}")
 
-                crt_init.restore()        
+                # Restore CRT state (might fail if PEB was corrupted, that's ok)
+                try:
+                    crt_init.restore()
+                except:
+                    pass
+                
+                # Free the PE memory
+                try:
+                    kernel32.VirtualFree(base_addr, 0, 0x8000)  # MEM_RELEASE
+                except:
+                    pass
+                    
                 return result
             
             except Exception as e:
-                crt_init.restore()
-                kernel32.VirtualFree(base_addr, 0, 0x8000)  # MEM_RELEASE
+                try:
+                    crt_init.restore()
+                except:
+                    pass
+                try:
+                    kernel32.VirtualFree(base_addr, 0, 0x8000)  # MEM_RELEASE
+                except:
+                    pass
                 logging.error(f"PE execution failed: {e}")
                 raise
 
@@ -916,6 +1013,192 @@ class VeriductNativeLoader:
         
         logging.debug(f"Applied {reloc_count} relocations")
 
+    def _setup_argv_hooks(self):
+        """Create hook stubs for __p___argc and __p___argv that return our custom arguments."""
+        if not self.command_line:
+            return None, None
+        
+        # Parse command line into argc/argv
+        # Simple split on spaces (doesn't handle quotes, but good enough for now)
+        args = self.command_line.split()
+        argc = len(args)
+        
+        logging.info(f"Setting up argv hooks: argc={argc}, argv={args}")
+        
+        # Allocate persistent memory for:
+        # 1. The argc integer (4 bytes, but aligned to 8)
+        # 2. The argv pointer array (char**)
+        # 3. The actual argument strings
+        
+        kernel32 = ctypes.windll.kernel32
+        
+        # CRITICAL: Set proper return types for 64-bit pointers
+        kernel32.VirtualAlloc.restype = ctypes.c_void_p
+        
+        MEM_COMMIT = 0x1000
+        MEM_RESERVE = 0x2000
+        PAGE_READWRITE = 0x04
+        PAGE_EXECUTE_READWRITE = 0x40
+        
+        # Calculate total size needed
+        # - 8 bytes for argc (4 byte int + 4 padding for alignment)
+        # - 8 bytes per argv pointer + null terminator
+        # - String data
+        string_data_size = sum(len(arg) + 1 for arg in args)  # +1 for null terminator each
+        argv_array_size = (argc + 1) * 8  # +1 for NULL terminator, 8 bytes per pointer (x64)
+        total_size = 8 + argv_array_size + string_data_size + 64  # +64 padding
+        
+        # Allocate data memory
+        data_mem = kernel32.VirtualAlloc(None, total_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        if not data_mem:
+            logging.error("Failed to allocate memory for argv data")
+            return None, None
+        
+        # Layout:
+        # [0:4] = argc (int, 4 bytes)
+        # [8:8+argv_array_size] = argv array (char**) - start at offset 8 for alignment
+        # [8+argv_array_size:] = string data
+        
+        argc_ptr = data_mem
+        argv_array_ptr = data_mem + 8
+        string_ptr = data_mem + 8 + argv_array_size
+        
+        # Write argc as 4-byte int
+        ctypes.memmove(argc_ptr, struct.pack('<i', argc), 4)
+        
+        # Write strings and build argv array
+        current_string_ptr = string_ptr
+        for i, arg in enumerate(args):
+            # Write the string
+            arg_bytes = arg.encode('ascii') + b'\x00'
+            ctypes.memmove(current_string_ptr, arg_bytes, len(arg_bytes))
+            
+            # Write pointer to this string in argv array
+            ctypes.memmove(argv_array_ptr + i * 8, struct.pack('<Q', current_string_ptr), 8)
+            
+            current_string_ptr += len(arg_bytes)
+        
+        # Write NULL terminator for argv array
+        ctypes.memmove(argv_array_ptr + argc * 8, struct.pack('<Q', 0), 8)
+        
+        # Store for later reference (prevent garbage collection issues)
+        self._argc_ptr = argc_ptr
+        self._argv_ptr = argv_array_ptr
+        self._argv_data_mem = data_mem
+        
+        # Now create the hook stubs
+        # __p___argc returns int* (pointer to argc)
+        # __p___argv returns char*** (pointer to argv)
+        
+        # For x64:
+        # mov rax, <address>
+        # ret
+        
+        # Hook for __p___argc - returns pointer to argc
+        argc_stub = b'\x48\xB8' + struct.pack('<Q', argc_ptr) + b'\xC3'
+        
+        # Hook for __p___argv - returns pointer to argv pointer
+        # We need to return a pointer TO the argv array pointer
+        # So we need another level of indirection
+        # Allocate 8 bytes to hold the argv_array_ptr value
+        argv_ptr_ptr = kernel32.VirtualAlloc(None, 8, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        ctypes.memmove(argv_ptr_ptr, struct.pack('<Q', argv_array_ptr), 8)
+        self._argv_ptr_ptr = argv_ptr_ptr
+        
+        argv_stub = b'\x48\xB8' + struct.pack('<Q', argv_ptr_ptr) + b'\xC3'
+        
+        # Allocate executable memory for stubs
+        argc_hook = kernel32.VirtualAlloc(None, len(argc_stub), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+        argv_hook = kernel32.VirtualAlloc(None, len(argv_stub), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+        
+        if argc_hook:
+            ctypes.memmove(argc_hook, argc_stub, len(argc_stub))
+            logging.info(f"Created __p___argc hook at 0x{argc_hook:X}")
+        
+        if argv_hook:
+            ctypes.memmove(argv_hook, argv_stub, len(argv_stub))
+            logging.info(f"Created __p___argv hook at 0x{argv_hook:X}")
+        
+        return argc_hook, argv_hook
+
+    def _create_exit_hook(self):
+        """Create a hook stub for exit() that calls _cexit() then ExitThread.
+        
+        This prevents CRT state corruption by:
+        1. Calling _cexit() to flush buffers and release locks (without closing handles)
+        2. Then calling ExitThread() to terminate just the PE thread
+        
+        x64 Assembly:
+            sub rsp, 0x28           ; Align stack (shadow space)
+            mov rax, <_cexit>       ; Load _cexit address
+            call rax                ; Call _cexit (flushes buffers, releases locks)
+            add rsp, 0x28           ; Restore stack
+            xor rcx, rcx            ; Exit code 0
+            mov rax, <ExitThread>   ; Load ExitThread address
+            jmp rax                 ; Jump to ExitThread
+        """
+        kernel32 = ctypes.windll.kernel32
+        
+        # Ensure proper return types for 64-bit pointers
+        kernel32.GetProcAddress.restype = ctypes.c_void_p
+        kernel32.GetModuleHandleA.restype = ctypes.c_void_p
+        kernel32.VirtualAlloc.restype = ctypes.c_void_p
+        
+        MEM_COMMIT = 0x1000
+        MEM_RESERVE = 0x2000
+        PAGE_EXECUTE_READWRITE = 0x40
+        
+        # Get ExitThread address from kernel32
+        k32_handle = kernel32.GetModuleHandleA(b'kernel32.dll')
+        exit_thread_addr = kernel32.GetProcAddress(k32_handle, b'ExitThread')
+        
+        if not exit_thread_addr:
+            logging.error("Failed to get ExitThread address")
+            return None
+        
+        # Get _cexit address from ucrtbase.dll
+        try:
+            ucrt = ctypes.CDLL("ucrtbase.dll")
+            cexit_addr = kernel32.GetProcAddress(ucrt._handle, b"_cexit")
+        except:
+            # Try api-ms-win-crt-runtime
+            try:
+                ucrt = ctypes.CDLL("api-ms-win-crt-runtime-l1-1-0.dll")
+                cexit_addr = kernel32.GetProcAddress(ucrt._handle, b"_cexit")
+            except:
+                logging.warning("Could not find _cexit, falling back to direct ExitThread")
+                cexit_addr = None
+        
+        if cexit_addr:
+            # Safe exit stub: _cexit() then ExitThread()
+            shellcode = (
+                b'\x48\x83\xEC\x28'                              # sub rsp, 0x28 (align stack)
+                + b'\x48\xB8' + struct.pack('<Q', cexit_addr)    # mov rax, _cexit
+                + b'\xFF\xD0'                                    # call rax
+                + b'\x48\x83\xC4\x28'                            # add rsp, 0x28
+                + b'\x48\x31\xC9'                                # xor rcx, rcx (exit code 0)
+                + b'\x48\xB8' + struct.pack('<Q', exit_thread_addr)  # mov rax, ExitThread
+                + b'\xFF\xE0'                                    # jmp rax
+            )
+            logging.info(f"Created safe exit hook: _cexit(0x{cexit_addr:X}) -> ExitThread(0x{exit_thread_addr:X})")
+        else:
+            # Fallback: direct ExitThread (may still cause issues)
+            shellcode = b'\x48\xB8' + struct.pack('<Q', exit_thread_addr) + b'\xFF\xE0'
+            logging.warning(f"Created fallback exit hook -> ExitThread(0x{exit_thread_addr:X})")
+        
+        # Allocate executable memory for the stub
+        stub_addr = kernel32.VirtualAlloc(
+            None, len(shellcode), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE
+        )
+        
+        if stub_addr:
+            ctypes.memmove(stub_addr, shellcode, len(shellcode))
+            logging.info(f"Exit hook stub at 0x{stub_addr:X}")
+            return stub_addr
+        
+        logging.error("Failed to allocate memory for exit hook")
+        return None
+
     def _resolve_pe_imports(self, base_addr, import_rva):
         """Walks Import Descriptor, loads DLLs, fills IAT."""
         kernel32 = ctypes.windll.kernel32
@@ -926,6 +1209,15 @@ class VeriductNativeLoader:
         
         kernel32.LoadLibraryA.argtypes = [ctypes.c_char_p]
         kernel32.LoadLibraryA.restype = ctypes.c_void_p
+        
+        # Set up argv hooks if we have a custom command line
+        argc_hook = None
+        argv_hook = None
+        if self.command_line:
+            argc_hook, argv_hook = self._setup_argv_hooks()
+        
+        # Create exit hook to prevent CRT cleanup from corrupting Python
+        exit_hook = self._create_exit_hook()
         
         desc_ptr = base_addr + import_rva
         dll_count = 0
@@ -982,8 +1274,31 @@ class VeriductNativeLoader:
                     # Import by name - GetProcAddress takes c_char_p
                     name_ptr = base_addr + (thunk_data & 0x7FFFFFFF) + 2
                     func_name_bytes = ctypes.string_at(name_ptr)
-                    # Pass as bytes directly (c_char_p)
-                    proc_addr = kernel32.GetProcAddress(h_module, func_name_bytes)
+                    dll_lower = dll_name.lower()
+                    
+                    # IAT HOOK: Swap ExitProcess -> ExitThread to keep host process alive
+                    if dll_lower == 'kernel32.dll' and func_name_bytes == b'ExitProcess':
+                        logging.debug("IAT Hook: Redirecting ExitProcess -> ExitThread")
+                        proc_addr = kernel32.GetProcAddress(h_module, b'ExitThread')
+                    
+                    # IAT HOOK: exit/_exit/quick_exit -> ExitThread (prevent CRT cleanup)
+                    elif func_name_bytes in (b'exit', b'_exit', b'quick_exit', b'_Exit') and exit_hook:
+                        logging.info(f"IAT Hook: Redirecting {func_name_bytes.decode()} -> ExitThread")
+                        proc_addr = exit_hook
+                    
+                    # IAT HOOK: __p___argc -> our hook (returns pointer to custom argc)
+                    elif func_name_bytes == b'__p___argc' and argc_hook:
+                        logging.info(f"IAT Hook: Redirecting __p___argc -> 0x{argc_hook:X}")
+                        proc_addr = argc_hook
+                    
+                    # IAT HOOK: __p___argv -> our hook (returns pointer to custom argv)
+                    elif func_name_bytes == b'__p___argv' and argv_hook:
+                        logging.info(f"IAT Hook: Redirecting __p___argv -> 0x{argv_hook:X}")
+                        proc_addr = argv_hook
+                    
+                    else:
+                        # Pass as bytes directly (c_char_p)
+                        proc_addr = kernel32.GetProcAddress(h_module, func_name_bytes)
                 
                 if proc_addr:
                     if is_64:
@@ -1614,13 +1929,14 @@ class VeriductExecutionCore:
     Unified execution core supporting Python bytecode and native binaries.
     Handles streaming reconstruction and format-specific execution.
     """
-    def __init__(self, original_file_extension: str, original_header: bytes = b'', wipe_size: int = 0):
+    def __init__(self, original_file_extension: str, original_header: bytes = b'', wipe_size: int = 0, command_line: str = None):
         self.file_ext = original_file_extension.lower()
         self.byte_count = 0
         self.bytecode_stream = bytearray()
         self.original_header = original_header
         self.wipe_size = wipe_size
         self.memory = MemorySubstrate()
+        self.command_line = command_line  # Command line args to pass to PE
         logging.info(f"VeriductExecutionCore initialized for: {self.file_ext}")
 
     def process_instruction_chunk(self, plaintext_chunk: bytes) -> bool:
@@ -1645,7 +1961,7 @@ class VeriductExecutionCore:
         
         # Route to appropriate executor
         if self.file_ext in ('.exe', '.dll', '.elf', ''):
-            self._execute_native(reconstructed)
+            self._execute_native(reconstructed, self.command_line)
         elif self.file_ext in ('.pyc', '.py'):
             self._execute_python(reconstructed)
         else:
@@ -1653,13 +1969,15 @@ class VeriductExecutionCore:
             logging.info("Attempting Python execution as fallback")
             self._execute_python(reconstructed)
 
-    def _execute_native(self, data: bytearray):
+    def _execute_native(self, data: bytearray, command_line: str = None):
         """Execute native binary (PE/ELF)."""
         logging.info("=" * 60)
         logging.info("NATIVE BINARY EXECUTION")
         logging.info("=" * 60)
+        if command_line:
+            logging.info(f"Command line: {command_line}")
         
-        loader = VeriductNativeLoader(data)
+        loader = VeriductNativeLoader(data, command_line=command_line)
         loader.parse_headers()
         
         if loader.is_valid:
@@ -2095,11 +2413,21 @@ def run_annihilated_path(
     key_path: str,
     disguise: Optional[str] = None,
     ignore_integrity: bool = False,
-    verbose: bool = False
+    verbose: bool = False,
+    command_line: str = None,
+    target_file: str = None
 ) -> int:
     """
     Execute annihilated files directly from chunks without reassembly.
     Supports Python bytecode and native binaries (PE/ELF).
+    
+    Args:
+        key_path: Path to keymap file
+        disguise: Disguise format (csv, log, conf)
+        ignore_integrity: Skip integrity checks
+        verbose: Verbose output
+        command_line: Command line arguments to pass to the executed binary
+        target_file: Specific file in keymap to execute (None = execute all)
     """
     key_path_abs = os.path.abspath(key_path)
     db_path = os.path.join(os.path.dirname(key_path_abs), DB_FILE)
@@ -2130,6 +2458,17 @@ def run_annihilated_path(
     for rel_path, file_data in key_map.items():
         if rel_path == 'format_version':
             continue
+        
+        # If target_file specified, only execute that file
+        if target_file:
+            # Match by filename (with or without extension)
+            filename = os.path.basename(rel_path)
+            filename_no_ext = os.path.splitext(filename)[0]
+            target_base = os.path.basename(target_file)
+            target_no_ext = os.path.splitext(target_base)[0]
+            
+            if filename != target_base and filename_no_ext != target_no_ext and filename != target_file:
+                continue
 
         try:
             logging.info("=" * 60)
@@ -2148,9 +2487,15 @@ def run_annihilated_path(
 
             # Determine file type
             _, file_ext = os.path.splitext(rel_path)
+            
+            # Build command line: "exename args..."
+            full_command_line = rel_path
+            if command_line:
+                full_command_line = f"{rel_path} {command_line}"
+                logging.info(f"Command line: {full_command_line}")
 
-            # Initialize execution core
-            vm = VeriductExecutionCore(file_ext, original_header, wipe_size)
+            # Initialize execution core with command line
+            vm = VeriductExecutionCore(file_ext, original_header, wipe_size, command_line=full_command_line)
 
             # Initialize disentangler if needed
             disentangler = StreamingDisentangler(entanglement_info) if entanglement_info else None

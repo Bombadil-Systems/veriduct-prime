@@ -418,6 +418,12 @@ class VeriductGUI:
         self.run_keymap.grid(row=0, column=1, padx=5, pady=5, sticky=tk.EW)
         ttk.Button(input_frame, text="Browse", command=lambda: self._browse_file(self.run_keymap)).grid(row=0, column=2, padx=5)
         
+        ttk.Label(input_frame, text="Arguments:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.run_args = ttk.Entry(input_frame, width=60)
+        self.run_args.grid(row=1, column=1, padx=5, pady=5, sticky=tk.EW)
+        ttk.Label(input_frame, text="(e.g., --exploit 1 --payload test)", 
+                 foreground='#888', font=('Helvetica', 8)).grid(row=1, column=2, padx=5)
+        
         input_frame.columnconfigure(1, weight=1)
         
         # Options
@@ -729,13 +735,17 @@ class VeriductGUI:
         if disguise == 'None':
             disguise = None
         
+        # Get arguments
+        args = self.run_args.get().strip() if self.run_args.get().strip() else None
+        
         def operation():
             try:
                 veriduct_prime.run_annihilated_path(
                     key_path=keymap_path,
                     disguise=disguise,
                     ignore_integrity=self.run_ignore_integrity_var.get(),
-                    verbose=self.run_verbose_var.get()
+                    verbose=self.run_verbose_var.get(),
+                    command_line=args
                 )
                 self.root.after(0, lambda: self._set_running(False))
                 
