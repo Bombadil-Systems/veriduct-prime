@@ -207,7 +207,6 @@ class VeriductGUI:
         self._create_annihilate_tab()
         self._create_reassemble_tab()
         self._create_run_tab()
-        self._create_blob_tab()
         
         # Log output area
         log_frame = ttk.LabelFrame(main_frame, text="Output Log", padding="5")
@@ -333,16 +332,6 @@ class VeriductGUI:
         self.fake_ratio.set(0.25)
         self.fake_ratio.grid(row=7, column=1, sticky=tk.W, pady=3)
         
-        # Blob options
-        blob_frame = ttk.LabelFrame(tab, text="Blob Output (Self-Executing)", padding="10")
-        blob_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        self.create_blob_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(blob_frame, text="Create .vdb blob", variable=self.create_blob_var).pack(side=tk.LEFT)
-        
-        self.blob_quiet_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(blob_frame, text="Quiet blob output", variable=self.blob_quiet_var).pack(side=tk.LEFT, padx=(20, 0))
-        
         # Execute button
         btn_frame = ttk.Frame(tab)
         btn_frame.pack(fill=tk.X, pady=(10, 0))
@@ -459,57 +448,6 @@ class VeriductGUI:
         self.run_btn = ttk.Button(btn_frame, text="EXECUTE", style='Accent.TButton', command=self._run_execute)
         self.run_btn.pack(side=tk.RIGHT)
 
-    def _create_blob_tab(self):
-        """Create the Blob Builder tab."""
-        tab = ttk.Frame(self.notebook, padding="15")
-        self.notebook.add(tab, text="Blob Builder")
-        
-        # Info
-        info_frame = ttk.Frame(tab)
-        info_frame.pack(fill=tk.X, pady=(0, 15))
-        
-        info_label = ttk.Label(info_frame,
-            text="Build self-executing .vdb blobs from existing keymap and chunks",
-            justify=tk.CENTER,
-            font=('Helvetica', 9)
-        )
-        info_label.pack()
-        
-        # Input section
-        input_frame = ttk.LabelFrame(tab, text="Input Files", padding="10")
-        input_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        ttk.Label(input_frame, text="Keymap File:").grid(row=0, column=0, sticky=tk.W, pady=5)
-        self.blob_keymap = ttk.Entry(input_frame, width=60)
-        self.blob_keymap.grid(row=0, column=1, padx=5, pady=5, sticky=tk.EW)
-        ttk.Button(input_frame, text="Browse", command=lambda: self._browse_file(self.blob_keymap)).grid(row=0, column=2, padx=5)
-        
-        ttk.Label(input_frame, text="Chunks DB:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.blob_chunks_db = ttk.Entry(input_frame, width=60)
-        self.blob_chunks_db.grid(row=1, column=1, padx=5, pady=5, sticky=tk.EW)
-        ttk.Button(input_frame, text="Browse", command=lambda: self._browse_file(self.blob_chunks_db)).grid(row=1, column=2, padx=5)
-        
-        ttk.Label(input_frame, text="Output Blob:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.blob_output = ttk.Entry(input_frame, width=60)
-        self.blob_output.grid(row=2, column=1, padx=5, pady=5, sticky=tk.EW)
-        ttk.Button(input_frame, text="Save As", command=self._browse_blob_save).grid(row=2, column=2, padx=5)
-        
-        input_frame.columnconfigure(1, weight=1)
-        
-        # Options
-        options_frame = ttk.LabelFrame(tab, text="Options", padding="10")
-        options_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        self.blob_build_quiet_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(options_frame, text="Quiet Mode (suppress output at runtime)", variable=self.blob_build_quiet_var).pack(anchor=tk.W)
-        
-        # Execute button
-        btn_frame = ttk.Frame(tab)
-        btn_frame.pack(fill=tk.X, pady=(10, 0))
-        
-        self.blob_btn = ttk.Button(btn_frame, text="BUILD BLOB", style='Accent.TButton', command=self._run_build_blob)
-        self.blob_btn.pack(side=tk.RIGHT)
-
     def _setup_logging(self):
         """Configure logging to use the queue handler."""
         # Create handler
@@ -575,16 +513,6 @@ class VeriductGUI:
             entry_widget.delete(0, tk.END)
             entry_widget.insert(0, dirpath)
 
-    def _browse_blob_save(self):
-        """Open save dialog for blob output."""
-        filepath = filedialog.asksaveasfilename(
-            defaultextension=".vdb",
-            filetypes=[("Veriduct Blob", "*.vdb"), ("All Files", "*.*")]
-        )
-        if filepath:
-            self.blob_output.delete(0, tk.END)
-            self.blob_output.insert(0, filepath)
-
     def _set_running(self, running):
         """Set operation running state."""
         self.operation_running = running
@@ -599,7 +527,7 @@ class VeriductGUI:
             state = 'normal'
         
         # Toggle all action buttons
-        for btn in [self.annihilate_btn, self.reassemble_btn, self.run_btn, self.blob_btn]:
+        for btn in [self.annihilate_btn, self.reassemble_btn, self.run_btn]:
             btn.configure(state=state)
 
     def _run_annihilate(self):
@@ -644,20 +572,6 @@ class VeriductGUI:
                     force_internal=self.force_internal_var.get(),
                     verbose=self.verbose_var.get()
                 )
-                
-                # Build blob if requested
-                if result == 0 and self.create_blob_var.get():
-                    keymap_path = os.path.join(output_dir, veriduct_prime.KEY_FILE)
-                    chunks_db_path = os.path.join(output_dir, veriduct_prime.DB_FILE)
-                    base_name = os.path.splitext(os.path.basename(input_path))[0]
-                    blob_output = os.path.join(output_dir, f"{base_name}.vdb")
-                    
-                    logging.info("")
-                    logging.info("=" * 60)
-                    logging.info("BUILDING SELF-EXECUTING BLOB")
-                    logging.info("=" * 60)
-                    
-                    veriduct_prime.build_blob(keymap_path, chunks_db_path, blob_output, self.blob_quiet_var.get())
                 
                 self.root.after(0, lambda: self._set_running(False))
                 
@@ -751,51 +665,6 @@ class VeriductGUI:
                 
             except Exception as e:
                 logging.error(f"Execution failed: {e}")
-                self.root.after(0, lambda: self._set_running(False))
-        
-        self._set_running(True)
-        self.current_thread = threading.Thread(target=operation, daemon=True)
-        self.current_thread.start()
-
-    def _run_build_blob(self):
-        """Run blob build operation."""
-        if veriduct_prime is None:
-            messagebox.showerror("Error", "veriduct_prime module not loaded!")
-            return
-        
-        keymap_path = self.blob_keymap.get().strip()
-        chunks_db = self.blob_chunks_db.get().strip()
-        output_path = self.blob_output.get().strip()
-        
-        if not keymap_path:
-            messagebox.showerror("Error", "Please specify a keymap file")
-            return
-        if not chunks_db:
-            messagebox.showerror("Error", "Please specify a chunks database")
-            return
-        if not output_path:
-            messagebox.showerror("Error", "Please specify an output path")
-            return
-        if not os.path.exists(keymap_path):
-            messagebox.showerror("Error", f"Keymap file does not exist: {keymap_path}")
-            return
-        if not os.path.exists(chunks_db):
-            messagebox.showerror("Error", f"Chunks database does not exist: {chunks_db}")
-            return
-        
-        def operation():
-            try:
-                veriduct_prime.build_blob(
-                    keymap_path,
-                    chunks_db,
-                    output_path,
-                    self.blob_build_quiet_var.get()
-                )
-                logging.info(f"✓ Blob created: {output_path}")
-                self.root.after(0, lambda: self._set_running(False))
-                
-            except Exception as e:
-                logging.error(f"Blob build failed: {e}")
                 self.root.after(0, lambda: self._set_running(False))
         
         self._set_running(True)

