@@ -1,159 +1,78 @@
-# Veriduct Prime v2.1 — Initial Public Release
+# Veriduct Prime v2.4 — Release Notes
 
-**December 16, 2025**
-
-## The Research the Security Industry Chose to Ignore
-
-After 12 months of attempted responsible disclosure to 50+ security firms and researchers, Veriduct Prime is now public.
+**January 2026**
 
 ---
 
-## What This Is
+## What's New
 
-**Format Destruction Framework for Binary Evasion**
+### StealthResolver & Native API Handling
 
-Veriduct Prime destroys binary file formats into unrecognizable chunks, then executes them semantically from memory without ever reconstructing the file on disk.
+Import resolution now uses hash-based lookup instead of string references. No API names appear in memory during execution.
 
-**Key Results:**
-- 143 VirusTotal detections → 0 (format destroyed) → 143 (reconstructed)
-- Byte-perfect reconstruction verified by SHA256 hash
-- 75% test battery pass rate on diverse Windows PE binaries
-- Working C2 agent demonstrates operational capability
+```python
+# Before: String-based (detectable)
+GetProcAddress(kernel32, "CreateFileW")
 
----
-
-## Why This Matters
-
-### For Red Teams
-You now have a framework that:
-- Bypasses signature-based detection by destroying the file format itself
-- Executes payloads from memory without file-on-disk artifacts
-- Provides deterministic verification (prove your bypass works)
-
-### For Blue Teams
-You now know:
-- Signature-based detection has a fundamental limitation
-- Fileless execution techniques are more accessible than assumed
-- Your detection strategy needs behavioral components
-
-### For the Industry
-This is what happens when credential gatekeeping replaces technical evaluation:
-- Novel research gets ignored
-- Capability gaps remain unaddressed
-- Public release becomes the only path to peer review
-
----
-
-## What's Included
-
-### Core Framework
-- `veriduct_prime.py` — Main annihilation/reassembly/execution engine
-- `veriduct_gui_final.py` — GUI interface
-
-### C2 System
-- `veriduct_agent.c` — Lightweight C2 beacon
-- `veriduct_c2_server.py` — Python C2 server
-
-### Tests
-- `test_veriduct_prime.py` — Core functionality tests
-- `test_battery.py` — Binary compatibility tests
-
-### Documentation
-- Architecture overview
-- API reference
-- Advanced features guide
-- Known limitations
-
----
-
-## Technical Validation
-
-### Test Battery Results
-
-| Test | Result | What It Validates |
-|------|--------|-------------------|
-| minimal_console | ✅ | Basic CRT, console I/O |
-| static_linked | ✅ | 64KB binary, no DLLs |
-| multithreaded | ✅ | Threading, TLS callbacks |
-| file_operations | ✅ | Filesystem access |
-| network_test | ✅ | Winsock networking |
-| crypto_test | ✅ | CryptoAPI |
-| windows_api | ❌ | GUI (known limitation) |
-| dll_test | ❌ | DLL standalone (by design) |
-
-**Pass Rate:** 75% (6/8)
-
-### C2 Agent Validation
-
-```
-Binary size:     78 KB
-Chunks created:  1,674
-DLLs loaded:     13
-Imports resolved: 77
-Network beacon:  Working
-Command exec:    Working
-Crashes:         0
+# Now: Hash-based (no strings)
+resolve_by_hash("kernel32.dll", 0x7c0017a5)
 ```
 
----
+### WINFUNCTYPE Integration
 
-## Known Limitations
+Windows API calls now use proper `ctypes.WINFUNCTYPE` declarations with correct calling conventions and type marshaling. This fixes edge cases where cdecl/stdcall mismatches caused crashes or silent corruption.
 
-**Production Ready:**
-- Windows PE executables (console apps, tools, agents)
+### Test Suite: 100% Pass Rate (Windows)
 
-**Limited Support:**
-- Linux ELF (stack initialization incomplete)
-- Windows GUI applications
-- DLLs (use reassemble mode)
+All Windows PE tests now pass:
 
-**Not Supported:**
-- .NET managed assemblies
-- macOS Mach-O binaries
+| Test | Status |
+|------|--------|
+| StealthResolver | ✅ |
+| WINFUNCTYPE | ✅ |
+| PE Execution | ✅ |
+| Multithreaded | ✅ |
+| Network | ✅ |
+| Crypto | ✅ |
+| File I/O | ✅ |
 
-See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for details.
+### VDB Deprecation (GUI)
 
----
-
-## A Note on Responsible Disclosure
-
-I tried to do this the right way.
-
-The pattern is clear: **technical merit is evaluated, then credentials are checked, then engagement ceases.**
-
-This isn't about me. This is about an industry that filters novel research based on pedigree rather than substance. When that happens, the only remaining option is public release.
-
-The security community can now evaluate this work on its technical merits, as it should have been evaluated from the start.
+The VDB (Veriduct Database) storage format is being phased out. The GUI no longer exposes VDB options. SQLite chunk storage remains the default and recommended approach.
 
 ---
 
-## What Happens Next
+## Technical Changes
 
-This release is:
-- **A capability demonstration** — Format destruction works
-- **A peer review invitation** — Break it, improve it, extend it
-- **A conversation starter** — About detection paradigms and industry gatekeeping
-
-I'll be presenting at security conferences that accept novel research.  
-I'll be responding to technical questions and feedback.  
-I'll be watching whether this generates the discussion that private disclosure couldn't.
+- **Import resolution**: Hash-based lookup via StealthResolver
+- **API calling**: WINFUNCTYPE with explicit prototypes
+- **Error handling**: Improved diagnostics for loader failures
+- **Code cleanup**: Removed experimental VDB paths from GUI
 
 ---
 
-## Contact
+## Upgrade Notes
 
-**Chris**  
-Founder, Bombadil Systems LLC
-
-- Website: [bombadil.systems](https://bombadil.systems)
-- Veriduct: [veriduct.com](https://veriduct.com)
-- Research: research@bombadil.systems
-- GitHub: [bombadil-systems](https://github.com/bombadil-systems)
+If upgrading from v2.1-v2.3:
+- No keymap format changes — existing keymaps work
+- No chunk database changes — existing chunks work
+- VDB users: migrate to SQLite chunk storage
 
 ---
 
-## License
+## What's Next
 
-MIT License — Use it, extend it, break it, improve it.
+- Continued ELF loader improvements
+- Additional hash coverage for Windows APIs
+- Performance optimizations for large binaries
 
 ---
+
+## Links
+
+- Repository: [github.com/bombadil-systems/veriduct-prime](https://github.com/bombadil-systems/veriduct-prime)
+- Documentation: See README.md and docs/
+
+---
+
+*Veriduct Prime is developed by Chris @ Bombadil Systems LLC*
