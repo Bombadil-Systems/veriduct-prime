@@ -24,7 +24,7 @@ Native Loader Capabilities:
 - ELF: Section header parsing, dynamic linking, shared library loading, RELA/REL relocations
 - Memory management and cleanup
 
-Version: 2.0 (Enhanced Native Loader)
+Version: 2.1 (Hardened - Bounds Checking, Memory Safety, Leak Prevention)
 """
 
 import os
@@ -712,7 +712,14 @@ def semantic_unshatter(shattered: bytes, ssm_seed: bytes, insert_positions: List
 
 def entangle_chunks(chunks: List[bytes], group_size: int = 3) -> Tuple[List[bytes], Dict]:
     """
-    Reversible XOR entanglement with improved padding handling.
+    Reversible XOR entanglement with correct variable-size handling.
+    
+    CRITICAL FIX: Store full-length XOR state to preserve all bits needed for
+    correct disentanglement. Original lengths are tracked in metadata for
+    final truncation after disentanglement.
+    
+    The bug was: truncating entangled chunks to original length loses XOR state
+    bits needed to reconstruct subsequent chunks in the group.
     """
     if group_size < 2:
         return chunks, {"groups": []}
@@ -732,6 +739,7 @@ def entangle_chunks(chunks: List[bytes], group_size: int = 3) -> Tuple[List[byte
         padding_byte = 0xFF
         padded = [bytearray(x.ljust(maxlen, bytes([padding_byte]))) for x in originals]
 
+        # Build cumulative XOR prefix
         prefix = []
         acc = bytearray(maxlen)
         for p in padded:
@@ -739,8 +747,10 @@ def entangle_chunks(chunks: List[bytes], group_size: int = 3) -> Tuple[List[byte
                 acc[j] ^= p[j]
             prefix.append(bytes(acc))
 
-        for i, (idx, pref, orig_len) in enumerate(zip(idxs, prefix, original_lengths)):
-            entangled[idx] = pref[:orig_len]
+        # FIX: Store FULL prefix length, not truncated to original
+        # This preserves all XOR state bits needed for disentanglement
+        for i, (idx, pref) in enumerate(zip(idxs, prefix)):
+            entangled[idx] = pref  # Full maxlen, no truncation
 
         info["groups"].append({
             "idxs": idxs,
@@ -752,7 +762,12 @@ def entangle_chunks(chunks: List[bytes], group_size: int = 3) -> Tuple[List[byte
     return entangled, info
 
 def disentangle_chunks(entangled: List[bytes], info: Dict) -> List[bytes]:
-    """Reverse XOR entanglement."""
+    """
+    Reverse XOR entanglement and restore original chunk lengths.
+    
+    The entangled chunks are stored at maxlen to preserve full XOR state.
+    After disentanglement, we truncate to original_lengths.
+    """
     out = list(entangled)
     for g in info.get("groups", []):
         idxs = g["idxs"]
@@ -760,11 +775,17 @@ def disentangle_chunks(entangled: List[bytes], info: Dict) -> List[bytes]:
         original_lengths = g["original_lengths"]
         padding_byte = g.get("padding_byte", 0xFF)
 
+        # Entangled chunks should already be at maxlen
+        # If not (legacy data), pad them - but this may cause corruption
         prefix = []
         for i, idx in enumerate(idxs):
-            padded_chunk = bytearray(out[idx].ljust(maxlen, bytes([padding_byte])))
+            chunk = out[idx]
+            if len(chunk) < maxlen:
+                logging.warning(f"Entangled chunk {idx} is {len(chunk)} bytes, expected {maxlen} - padding (may cause corruption)")
+            padded_chunk = bytearray(chunk.ljust(maxlen, bytes([padding_byte])))
             prefix.append(padded_chunk)
 
+        # Reverse the XOR chain
         originals = []
         prev = bytearray(maxlen)
         for p in prefix:
@@ -774,6 +795,7 @@ def disentangle_chunks(entangled: List[bytes], info: Dict) -> List[bytes]:
             originals.append(bytes(orig))
             prev = p
 
+        # NOW truncate to original lengths (after disentanglement is complete)
         for i, (idx, orig, orig_len) in enumerate(zip(idxs, originals, original_lengths)):
             out[idx] = orig[:orig_len]
 
@@ -932,6 +954,10 @@ class VeriductNativeLoader:
         self.load_config_rva = 0
         self.load_config_size = 0
         self.command_line = command_line  # Command line to pass to PE
+        
+        # Track all VirtualAlloc allocations for cleanup (prevents memory leaks)
+        self._allocations = []
+        self._VirtualFree = None  # Cached for cleanup
 
     def parse_headers(self):
         """Identifies file type and parses structures."""
@@ -1136,16 +1162,26 @@ class VeriductNativeLoader:
                     characteristics = struct.unpack('<I', self.stream[current_offset+36:current_offset+40])[0]
             
                     if raw_size > 0 and v_addr > 0:
-                        dest = base_addr_int + v_addr
-                        data = self.stream[raw_ptr:raw_ptr + raw_size]
-                        ctypes.memmove(dest, bytes(data), len(data))
-                        logging.debug(f"Mapped section {i} at RVA 0x{v_addr:X}")
+                        # BOUNDS CHECK: Ensure section fits within allocated image
+                        if v_addr + raw_size > self.size_of_image:
+                            raise ValueError(f"Section {i} extends beyond image bounds (v_addr=0x{v_addr:X}, raw_size=0x{raw_size:X}, image_size=0x{self.size_of_image:X})")
+                        
+                        # BOUNDS CHECK: Ensure we have enough source data
+                        if raw_ptr + raw_size > len(self.stream):
+                            logging.warning(f"Section {i} raw data truncated (raw_ptr=0x{raw_ptr:X}, raw_size=0x{raw_size:X}, stream_len=0x{len(self.stream):X})")
+                            raw_size = min(raw_size, len(self.stream) - raw_ptr) if raw_ptr < len(self.stream) else 0
+                        
+                        if raw_size > 0:
+                            dest = base_addr_int + v_addr
+                            data = self.stream[raw_ptr:raw_ptr + raw_size]
+                            ctypes.memmove(dest, bytes(data), len(data))
+                            logging.debug(f"Mapped section {i} at RVA 0x{v_addr:X} ({raw_size} bytes)")
                 
-                        sections_to_protect.append({
-                            'addr': dest,
-                            'size': raw_size,
-                            'char': characteristics
-                        })
+                            sections_to_protect.append({
+                                'addr': dest,
+                                'size': raw_size,
+                                'char': characteristics
+                            })
             
                     current_offset += 40
         
@@ -1272,6 +1308,9 @@ class VeriductNativeLoader:
                 except:
                     pass
                 
+                # Free all tracked allocations (argv hooks, exit hooks, etc.)
+                self._cleanup_allocations(VirtualFree)
+                
                 # Free the PE memory
                 try:
                     VirtualFree(base_addr, 0, 0x8000)  # MEM_RELEASE
@@ -1285,27 +1324,71 @@ class VeriductNativeLoader:
                     crt_init.restore()
                 except:
                     pass
+                # Free all tracked allocations on error too
+                self._cleanup_allocations(VirtualFree)
                 try:
                     VirtualFree(base_addr, 0, 0x8000)  # MEM_RELEASE
                 except:
                     pass
                 logging.error(f"PE execution failed: {e}")
                 raise
+    
+    def _cleanup_allocations(self, VirtualFree=None):
+        """Free all tracked VirtualAlloc allocations to prevent memory leaks."""
+        if not self._allocations:
+            return
+        
+        # Use cached or provided VirtualFree
+        free_func = VirtualFree or self._VirtualFree
+        if not free_func:
+            logging.warning(f"Cannot free {len(self._allocations)} allocations - VirtualFree not available")
+            return
+        
+        MEM_RELEASE = 0x8000
+        freed_count = 0
+        
+        for addr in self._allocations:
+            try:
+                if addr:
+                    free_func(addr, 0, MEM_RELEASE)
+                    freed_count += 1
+            except Exception as e:
+                logging.debug(f"Failed to free allocation at 0x{addr:X}: {e}")
+        
+        if freed_count > 0:
+            logging.debug(f"Freed {freed_count} hook/stub allocations")
+        
+        self._allocations.clear()
 
     def _apply_pe_relocations(self, base_addr, reloc_rva, reloc_size, delta):
-        """Parses .reloc section and patches memory addresses."""
+        """
+        Parses .reloc section and patches memory addresses.
+        
+        Includes bounds checking to prevent writes outside the allocated image region.
+        """
         current_rva = reloc_rva
         end_rva = reloc_rva + reloc_size
+        
+        # Define valid address range for bounds checking
+        image_start = base_addr
+        image_end = base_addr + self.size_of_image
         
         def read_mem_u32(addr):
             return struct.unpack('<I', ctypes.string_at(addr, 4))[0]
         
         reloc_count = 0
+        skipped_oob = 0
+        
         while current_rva < end_rva:
             block_va = read_mem_u32(base_addr + current_rva)
             block_size = read_mem_u32(base_addr + current_rva + 4)
             
             if block_size == 0:
+                break
+            
+            # Validate block_size is sane
+            if block_size < 8 or block_size > (end_rva - current_rva + 8):
+                logging.warning(f"Invalid relocation block size {block_size} at RVA 0x{current_rva:X}, stopping")
                 break
             
             num_entries = (block_size - 8) // 2
@@ -1321,11 +1404,22 @@ class VeriductNativeLoader:
                 target_addr = base_addr + block_va + offset
                 
                 if type_ == 3:  # IMAGE_REL_BASED_HIGHLOW (32-bit)
+                    # BOUNDS CHECK: target + 4 bytes must be within image
+                    if not (image_start <= target_addr and target_addr + 4 <= image_end):
+                        logging.debug(f"Relocation target 0x{target_addr:X} out of bounds (32-bit), skipping")
+                        skipped_oob += 1
+                        continue
                     curr_val = struct.unpack('<I', ctypes.string_at(target_addr, 4))[0]
                     new_val = (curr_val + delta) & 0xFFFFFFFF
                     ctypes.memmove(target_addr, struct.pack('<I', new_val), 4)
                     reloc_count += 1
+                    
                 elif type_ == 10:  # IMAGE_REL_BASED_DIR64 (64-bit)
+                    # BOUNDS CHECK: target + 8 bytes must be within image
+                    if not (image_start <= target_addr and target_addr + 8 <= image_end):
+                        logging.debug(f"Relocation target 0x{target_addr:X} out of bounds (64-bit), skipping")
+                        skipped_oob += 1
+                        continue
                     curr_val = struct.unpack('<Q', ctypes.string_at(target_addr, 8))[0]
                     new_val = (curr_val + delta) & 0xFFFFFFFFFFFFFFFF
                     ctypes.memmove(target_addr, struct.pack('<Q', new_val), 8)
@@ -1333,10 +1427,15 @@ class VeriductNativeLoader:
             
             current_rva += block_size
         
+        if skipped_oob > 0:
+            logging.warning(f"Skipped {skipped_oob} out-of-bounds relocations")
         logging.debug(f"Applied {reloc_count} relocations")
 
     def _setup_argv_hooks(self):
-        """Create hook stubs for __p___argc and __p___argv that return our custom arguments."""
+        """Create hook stubs for __p___argc and __p___argv that return our custom arguments.
+        
+        All allocations are tracked in self._allocations for cleanup.
+        """
         if not self.command_line:
             return None, None
         
@@ -1349,6 +1448,8 @@ class VeriductNativeLoader:
         
         resolver = get_stealth_resolver()
         VirtualAlloc_addr = resolver.get_proc_address("kernel32.dll", "VirtualAlloc")
+        VirtualFree_addr = resolver.get_proc_address("kernel32.dll", "VirtualFree")
+        
         if not VirtualAlloc_addr:
             logging.error("Failed to resolve VirtualAlloc for argv hooks")
             return None, None
@@ -1356,6 +1457,12 @@ class VeriductNativeLoader:
         VirtualAlloc = ctypes.WINFUNCTYPE(
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.c_ulong
         )(VirtualAlloc_addr)
+        
+        # Cache VirtualFree for cleanup
+        if VirtualFree_addr and not self._VirtualFree:
+            self._VirtualFree = ctypes.WINFUNCTYPE(
+                ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong
+            )(VirtualFree_addr)
         
         MEM_COMMIT = 0x1000
         MEM_RESERVE = 0x2000
@@ -1377,6 +1484,7 @@ class VeriductNativeLoader:
             return None, None
         
         data_mem_int = data_mem if isinstance(data_mem, int) else ctypes.cast(data_mem, ctypes.c_void_p).value
+        self._allocations.append(data_mem_int)  # Track for cleanup
         
         # Layout:
         # [0:4] = argc (int, 4 bytes)
@@ -1429,6 +1537,7 @@ class VeriductNativeLoader:
         argv_ptr_ptr_int = argv_ptr_ptr if isinstance(argv_ptr_ptr, int) else ctypes.cast(argv_ptr_ptr, ctypes.c_void_p).value
         ctypes.memmove(argv_ptr_ptr_int, struct.pack('<Q', argv_array_ptr), 8)
         self._argv_ptr_ptr = argv_ptr_ptr_int
+        self._allocations.append(argv_ptr_ptr_int)  # Track for cleanup
         
         argv_stub = b'\x48\xB8' + struct.pack('<Q', argv_ptr_ptr_int) + b'\xC3'
         
@@ -1441,10 +1550,12 @@ class VeriductNativeLoader:
         
         if argc_hook_int:
             ctypes.memmove(argc_hook_int, argc_stub, len(argc_stub))
+            self._allocations.append(argc_hook_int)  # Track for cleanup
             logging.info(f"Created __p___argc hook at 0x{argc_hook_int:X}")
         
         if argv_hook_int:
             ctypes.memmove(argv_hook_int, argv_stub, len(argv_stub))
+            self._allocations.append(argv_hook_int)  # Track for cleanup
             logging.info(f"Created __p___argv hook at 0x{argv_hook_int:X}")
         
         return argc_hook_int, argv_hook_int
@@ -1455,6 +1566,8 @@ class VeriductNativeLoader:
         This prevents CRT state corruption by:
         1. Calling _cexit() to flush buffers and release locks (without closing handles)
         2. Then calling ExitThread() to terminate just the PE thread
+        
+        All allocations are tracked in self._allocations for cleanup.
         
         x64 Assembly:
             sub rsp, 0x28           ; Align stack (shadow space)
@@ -1480,6 +1593,8 @@ class VeriductNativeLoader:
         
         # Get VirtualAlloc for allocating our stub
         VirtualAlloc_addr = resolver.get_proc_address("kernel32.dll", "VirtualAlloc")
+        VirtualFree_addr = resolver.get_proc_address("kernel32.dll", "VirtualFree")
+        
         if not VirtualAlloc_addr:
             logging.error("Failed to resolve VirtualAlloc for exit hook")
             return None
@@ -1487,6 +1602,12 @@ class VeriductNativeLoader:
         VirtualAlloc = ctypes.WINFUNCTYPE(
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.c_ulong
         )(VirtualAlloc_addr)
+        
+        # Cache VirtualFree for cleanup
+        if VirtualFree_addr and not self._VirtualFree:
+            self._VirtualFree = ctypes.WINFUNCTYPE(
+                ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong
+            )(VirtualFree_addr)
         
         # Get _cexit address - need to load ucrtbase first
         cexit_addr = None
@@ -1526,6 +1647,7 @@ class VeriductNativeLoader:
         if stub_addr:
             stub_addr_int = stub_addr if isinstance(stub_addr, int) else ctypes.cast(stub_addr, ctypes.c_void_p).value
             ctypes.memmove(stub_addr_int, shellcode, len(shellcode))
+            self._allocations.append(stub_addr_int)  # Track for cleanup
             logging.info(f"Exit hook stub at 0x{stub_addr_int:X}")
             return stub_addr_int
         
@@ -1577,9 +1699,17 @@ class VeriductNativeLoader:
             dll_name = ctypes.string_at(base_addr + name_rva).decode('ascii')
             h_module = LoadLibraryA(dll_name.encode('ascii'))
             if not h_module:
-                logging.warning(f"Failed to load dependency: {dll_name}")
-                desc_ptr += 20
-                continue
+                # Check if this is a critical system DLL that should always be available
+                critical_dlls = {'kernel32.dll', 'ntdll.dll', 'user32.dll', 'advapi32.dll', 
+                                 'msvcrt.dll', 'ucrtbase.dll', 'vcruntime140.dll'}
+                dll_lower = dll_name.lower()
+                
+                if dll_lower in critical_dlls:
+                    raise RuntimeError(f"Failed to load critical dependency: {dll_name} - binary cannot execute")
+                else:
+                    logging.warning(f"Failed to load dependency: {dll_name} - some functionality may not work")
+                    desc_ptr += 20
+                    continue
             
             h_module_int = h_module if isinstance(h_module, int) else ctypes.cast(h_module, ctypes.c_void_p).value
             dll_count += 1
@@ -1594,6 +1724,8 @@ class VeriductNativeLoader:
             msb_mask = 0x8000000000000000 if is_64 else 0x80000000
             
             import_count = 0
+            failed_imports = []
+            
             while True:
                 if is_64:
                     thunk_data = struct.unpack('<Q', ctypes.string_at(thunk_ptr, 8))[0]
@@ -1644,19 +1776,24 @@ class VeriductNativeLoader:
                         ctypes.memmove(iat_ptr, struct.pack('<I', proc_addr_int), 4)
                     import_count += 1
                 else:
-                    # Log failed import resolution
+                    # Track failed imports for summary
                     if thunk_data & msb_mask:
-                        logging.warning(f"Failed to resolve {dll_name}!Ordinal{thunk_data & 0xFFFF}")
+                        failed_imports.append(f"{dll_name}!Ordinal{thunk_data & 0xFFFF}")
                     else:
                         try:
                             name_ptr = base_addr + (thunk_data & 0x7FFFFFFF) + 2
                             func_name = ctypes.string_at(name_ptr).decode('ascii', errors='ignore')
-                            logging.warning(f"Failed to resolve {dll_name}!{func_name}")
+                            failed_imports.append(f"{dll_name}!{func_name}")
                         except:
-                            logging.warning(f"Failed to resolve import from {dll_name}")
+                            failed_imports.append(f"{dll_name}!<unknown>")
                 
                 thunk_ptr += ptr_size
                 iat_ptr += ptr_size
+            
+            # Report failed imports for this DLL
+            if failed_imports:
+                logging.warning(f"  {dll_name}: {len(failed_imports)} unresolved imports: {', '.join(failed_imports[:5])}" + 
+                              (f" (and {len(failed_imports)-5} more)" if len(failed_imports) > 5 else ""))
             
             logging.debug(f"  Resolved {import_count} imports from {dll_name}")
             desc_ptr += 20
@@ -2031,6 +2168,8 @@ class VeriductNativeLoader:
         """
         Process RELA/REL relocations (GOT, PLT, and Relative).
         Specific to x86_64 ELF.
+        
+        Includes bounds checking to prevent writes outside mapped region.
         """
         if 7 not in self.dynamic_entries:  # DT_RELA
             return
@@ -2054,7 +2193,15 @@ class VeriductNativeLoader:
         num_relocs = rela_sz // rela_ent
         current_reloc = rela_addr
         
+        # Get mapped region bounds for validation
+        # Use stored value if available, otherwise use a safe estimate
+        region_start = base_addr
+        region_end = getattr(self, '_elf_mapped_end', base_addr + 0x10000000)
+        
         logging.info(f"Processing {num_relocs} ELF relocations...")
+        
+        applied_count = 0
+        skipped_oob = 0
 
         for _ in range(num_relocs):
             try:
@@ -2068,10 +2215,18 @@ class VeriductNativeLoader:
                 
                 target_addr = base_addr + r_offset if r_offset < base_addr else r_offset
                 
+                # BOUNDS CHECK: Ensure target is within mapped region
+                if not (region_start <= target_addr and target_addr + 8 <= region_end):
+                    logging.debug(f"ELF relocation target 0x{target_addr:X} out of bounds, skipping")
+                    skipped_oob += 1
+                    current_reloc += rela_ent
+                    continue
+                
                 # R_X86_64_RELATIVE (8) - Base relocation
                 if r_type == 8:
                     val = base_addr + r_addend
                     ctypes.memmove(target_addr, struct.pack('<Q', val), 8)
+                    applied_count += 1
                     
                 # R_X86_64_GLOB_DAT (6) or JUMP_SLOT (7) - Symbol lookup
                 elif r_type in (6, 7) and r_sym != 0:
@@ -2093,6 +2248,7 @@ class VeriductNativeLoader:
                                 
                                 ctypes.memmove(target_addr, struct.pack('<Q', addr), 8)
                                 found = True
+                                applied_count += 1
                                 break
                             except (AttributeError, OSError):
                                 continue
@@ -2105,11 +2261,17 @@ class VeriductNativeLoader:
                 logging.debug(f"Error processing relocation: {e}")
                 current_reloc += rela_ent
                 continue
+        
+        if skipped_oob > 0:
+            logging.warning(f"Skipped {skipped_oob} out-of-bounds ELF relocations")
+        logging.debug(f"Applied {applied_count} ELF relocations")
 
     def _execute_elf_linux(self):
         """
         ELF loader using mmap.
         Handles PT_LOAD segments. Best with static binaries or simple PIE.
+        
+        Includes bounds checking and size validation.
         """
         import mmap
         
@@ -2127,49 +2289,135 @@ class VeriductNativeLoader:
                 p_vaddr = struct.unpack('<Q', self.stream[offset+16:offset+24])[0]
                 p_filesz = struct.unpack('<Q', self.stream[offset+32:offset+40])[0]
                 p_memsz = struct.unpack('<Q', self.stream[offset+40:offset+48])[0]
+                p_flags = struct.unpack('<I', self.stream[offset+4:offset+8])[0]
                 
                 if p_vaddr < min_vaddr:
                     min_vaddr = p_vaddr
                 if p_vaddr + p_memsz > max_vaddr:
                     max_vaddr = p_vaddr + p_memsz
                 
-                load_segments.append((p_offset, p_vaddr, p_filesz, p_memsz))
-                logging.debug(f"PT_LOAD: VAddr 0x{p_vaddr:X}, FileSz {p_filesz}, MemSz {p_memsz}")
+                load_segments.append((p_offset, p_vaddr, p_filesz, p_memsz, p_flags))
+                logging.debug(f"PT_LOAD: VAddr 0x{p_vaddr:X}, FileSz {p_filesz}, MemSz {p_memsz}, Flags {p_flags:#x}")
+
+        # Validate we have segments to load
+        if not load_segments:
+            raise RuntimeError("ELF has no PT_LOAD segments")
+        
+        # Validate address range
+        if max_vaddr <= min_vaddr:
+            raise RuntimeError(f"Invalid ELF virtual address range: max=0x{max_vaddr:X} <= min=0x{min_vaddr:X}")
 
         total_size = max_vaddr - min_vaddr
-        total_size = (total_size + 4095) & ~4095  # Page align
         
-        logging.info(f"Allocating {total_size} bytes for ELF")
+        # Sanity check on size (reject obviously malformed binaries)
+        MAX_REASONABLE_SIZE = 1024 * 1024 * 1024  # 1GB
+        if total_size > MAX_REASONABLE_SIZE:
+            raise RuntimeError(f"ELF image size {total_size} exceeds maximum ({MAX_REASONABLE_SIZE})")
         
-        # Allocate executable memory
+        # Page align with overflow check
+        total_size_aligned = (total_size + 4095) & ~4095
+        if total_size_aligned < total_size:
+            raise RuntimeError(f"Size overflow during page alignment")
+        total_size = total_size_aligned
+        
+        logging.info(f"Allocating {total_size} bytes for ELF (range: 0x{min_vaddr:X}-0x{max_vaddr:X})")
+        
+        # Allocate memory as RW first (will apply proper protections after loading)
         mem = mmap.mmap(
             -1, 
             total_size, 
             mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
-            mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC
+            mmap.PROT_READ | mmap.PROT_WRITE
         )
         
         base_addr = ctypes.addressof(ctypes.c_char.from_buffer(mem))
+        
+        # Store mapped region end for bounds checking in relocations
+        self._elf_mapped_end = base_addr + total_size
+        self._elf_mmap = mem  # Keep reference for mprotect
+        
         logging.info(f"Mapped ELF memory at 0x{base_addr:X}")
         
+        # Track segments for later mprotect
+        segment_protections = []
+        
         # Load Segments
-        for offset, vaddr, filesz, memsz in load_segments:
+        for p_offset, vaddr, filesz, memsz, p_flags in load_segments:
             # Handle PIE (position independent) - if vaddr is small, it's relative
-            dest_addr = base_addr + vaddr if vaddr < 0x10000000 else vaddr
+            if vaddr < 0x10000000:
+                dest_addr = base_addr + vaddr
+                segment_base = vaddr
+            else:
+                dest_addr = vaddr
+                segment_base = vaddr - min_vaddr
+            
+            # BOUNDS CHECK: Ensure segment fits in allocated region
+            if segment_base + memsz > total_size:
+                raise RuntimeError(f"ELF segment extends beyond allocated region (vaddr=0x{vaddr:X}, memsz=0x{memsz:X})")
+            
+            # BOUNDS CHECK: Ensure we have source data
+            if p_offset + filesz > len(self.stream):
+                logging.warning(f"ELF segment source data truncated")
+                filesz = min(filesz, len(self.stream) - p_offset) if p_offset < len(self.stream) else 0
             
             # Copy file data
-            data = self.stream[offset : offset + filesz]
-            ctypes.memmove(dest_addr, bytes(data), len(data))
+            if filesz > 0:
+                data = self.stream[p_offset : p_offset + filesz]
+                ctypes.memmove(dest_addr, bytes(data), len(data))
             
             # Zero BSS
             if memsz > filesz:
                 ctypes.memset(dest_addr + filesz, 0, memsz - filesz)
+            
+            # Track for mprotect (page-align the range)
+            page_start = (dest_addr) & ~4095
+            page_end = (dest_addr + memsz + 4095) & ~4095
+            segment_protections.append((page_start, page_end - page_start, p_flags))
 
         # Resolve Dynamic Dependencies
         if hasattr(self, 'dynamic_entries') and self.dynamic_entries:
             logging.info("Resolving dynamic linking...")
             self._load_elf_dependencies(base_addr)
             self._resolve_elf_relocations(base_addr)
+
+        # Apply proper memory protections (reduce RWX exposure)
+        try:
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            mprotect = libc.mprotect
+            mprotect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+            mprotect.restype = ctypes.c_int
+            
+            PROT_READ = 0x1
+            PROT_WRITE = 0x2
+            PROT_EXEC = 0x4
+            
+            for page_start, page_size, p_flags in segment_protections:
+                prot = 0
+                if p_flags & 0x4:  # PF_R
+                    prot |= PROT_READ
+                if p_flags & 0x2:  # PF_W
+                    prot |= PROT_WRITE
+                if p_flags & 0x1:  # PF_X
+                    prot |= PROT_EXEC
+                
+                # Ensure at least read permission
+                if prot == 0:
+                    prot = PROT_READ
+                
+                result = mprotect(page_start, page_size, prot)
+                if result == 0:
+                    logging.debug(f"mprotect 0x{page_start:X} ({page_size} bytes): flags={prot:#x}")
+                else:
+                    logging.warning(f"mprotect failed for 0x{page_start:X}")
+                    
+        except Exception as e:
+            logging.warning(f"Could not apply segment protections (continuing with RWX): {e}")
+            # Fall back to making everything executable
+            try:
+                libc = ctypes.CDLL("libc.so.6")
+                libc.mprotect(base_addr, total_size, 0x7)  # RWX fallback
+            except:
+                pass
 
         # Calculate entry point
         real_entry = base_addr + self.entry_point
