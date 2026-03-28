@@ -18,13 +18,14 @@ Features:
 - Disguised keymaps
 - Fileless execution via MemorySubstrate
 - Native binary loading (PE/ELF)
+- Identity Cloak (runtime PEB masquerade)
 
 Native Loader Capabilities:
 - PE: TLS callbacks, SEH registration, delay-load imports, import resolution, base relocations
 - ELF: Section header parsing, dynamic linking, shared library loading, RELA/REL relocations
 - Memory management and cleanup
 
-Version: 2.1 (Hardened - Bounds Checking, Memory Safety, Leak Prevention)
+Version: 2.2 (Identity Cloak - Live Process Clone)
 """
 
 import os
@@ -588,6 +589,504 @@ class CRTInitializer:
                 pass
 
 # ==============================================================================
+# Identity Cloak - Runtime PEB Identity Masquerade (Live Clone)
+# ==============================================================================
+# Enumerates running processes, picks a real instance of the target, reads its
+# actual PEB values via ReadProcessMemory, and clones them onto the current
+# process.  The disguise is an exact copy of something already running on the
+# box — not a guess, not a hardcoded string.
+#
+# What it modifies  (ASSUMED — no kernel verification):
+#   CommandLine, ImagePathName, CurrentDirectory, Environment
+#
+# What it cannot modify (VERIFIED — kernel-enforced):
+#   Token SID, Integrity Level, Session ID, EPROCESS ImageFileName
+# ==============================================================================
+
+# Toolhelp32 snapshot struct
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize",              wintypes.DWORD),
+        ("cntUsage",            wintypes.DWORD),
+        ("th32ProcessID",       wintypes.DWORD),
+        ("th32DefaultHeapID",   ctypes.c_void_p),
+        ("th32ModuleID",        wintypes.DWORD),
+        ("cntThreads",          wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase",      wintypes.LONG),
+        ("dwFlags",             wintypes.DWORD),
+        ("szExeFile",           wintypes.WCHAR * 260),
+    ]
+
+# Remote PEB reading offsets (x64)
+_PP_OFFSET_IN_PEB      = 0x20   # PEB -> ProcessParameters pointer
+_CMD_OFFSET_IN_PP      = 0x70   # ProcessParameters -> CommandLine
+_IMGPATH_OFFSET_IN_PP  = 0x60   # ProcessParameters -> ImagePathName
+_CURDIR_OFFSET_IN_PP   = 0x38   # ProcessParameters -> CurrentDirectory.DosPath
+_ENV_OFFSET_IN_PP      = 0x80   # ProcessParameters -> Environment pointer
+_US_SIZE               = 16     # sizeof(UNICODE_STRING) on x64
+
+# Access rights
+_PROCESS_QUERY_INFORMATION = 0x0400
+_PROCESS_VM_READ           = 0x0010
+_TH32CS_SNAPPROCESS        = 0x00000002
+_INVALID_HANDLE            = ctypes.c_void_p(-1).value & 0xFFFFFFFFFFFFFFFF
+
+
+class IdentityCloak:
+    """
+    Live-clones PEB identity markers from a real running process.
+    """
+
+    def __init__(self, target_name: str = None, custom_config: dict = None):
+        """
+        Args:
+            target_name:   Process name to clone, e.g. "svchost" or "RuntimeBroker".
+                           Resolved to a live PID at apply() time.
+            custom_config: Dict with explicit values (skips live enumeration).
+                           Keys: command_line, image_path, current_dir,
+                                 env_username, env_userdomain
+        """
+        self.target_name = target_name
+        self.custom_config = custom_config
+        self.active = False
+        self.config = {}   # populated at apply() time
+
+        self._orig_command_line = None
+        self._orig_image_path = None
+        self._orig_current_dir = None
+        self._orig_env_ptr = None
+        self._alloc_buffers = []
+        self._peb_ptr = None
+        self._params_addr = None
+        self._VirtualAlloc = None
+        self._VirtualFree = None
+
+    # ------------------------------------------------------------------
+    # Live process enumeration
+    # ------------------------------------------------------------------
+
+    def _resolve_enum_apis(self):
+        """Resolve Toolhelp32 + remote PEB reading APIs via stealth."""
+        r = get_stealth_resolver()
+        self._CreateToolhelp32Snapshot = ctypes.WINFUNCTYPE(
+            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD
+        )(r.get_proc_address("kernel32.dll", "CreateToolhelp32Snapshot"))
+
+        self._Process32FirstW = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)
+        )(r.get_proc_address("kernel32.dll", "Process32FirstW"))
+
+        self._Process32NextW = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)
+        )(r.get_proc_address("kernel32.dll", "Process32NextW"))
+
+        self._OpenProcess = ctypes.WINFUNCTYPE(
+            ctypes.c_void_p, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD
+        )(r.get_proc_address("kernel32.dll", "OpenProcess"))
+
+        self._CloseHandle = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, ctypes.c_void_p
+        )(r.get_proc_address("kernel32.dll", "CloseHandle"))
+
+        self._ReadProcessMemory = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)
+        )(r.get_proc_address("kernel32.dll", "ReadProcessMemory"))
+
+        nqip = r.get_proc_address("ntdll.dll", "NtQueryInformationProcess")
+        self._NtQueryInformationProcess = ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.c_void_p, ctypes.c_ulong,
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(wintypes.ULONG)
+        )(nqip)
+
+    def _find_target_pids(self, name: str) -> list:
+        """Return list of PIDs matching process name (case-insensitive)."""
+        name_lower = name.lower()
+        # Normalise: allow "svchost" or "svchost.exe"
+        if not name_lower.endswith('.exe'):
+            name_lower += '.exe'
+
+        snap = self._CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+        snap_int = snap if isinstance(snap, int) else ctypes.cast(snap, ctypes.c_void_p).value or 0
+        if snap_int == 0 or snap_int == _INVALID_HANDLE:
+            logging.warning("IdentityCloak: CreateToolhelp32Snapshot failed")
+            return []
+
+        pids = []
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+
+        if self._Process32FirstW(snap_int, ctypes.byref(entry)):
+            while True:
+                exe = entry.szExeFile
+                if exe.lower() == name_lower:
+                    pids.append(entry.th32ProcessID)
+                entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+                if not self._Process32NextW(snap_int, ctypes.byref(entry)):
+                    break
+
+        self._CloseHandle(snap_int)
+        return pids
+
+    def _read_remote_mem(self, hProcess, address: int, size: int) -> bytes:
+        """ReadProcessMemory wrapper."""
+        buf = ctypes.create_string_buffer(size)
+        bytes_read = ctypes.c_size_t(0)
+        ok = self._ReadProcessMemory(
+            hProcess, ctypes.c_void_p(address),
+            buf, size, ctypes.byref(bytes_read)
+        )
+        if not ok or bytes_read.value == 0:
+            return b''
+        return buf.raw[:bytes_read.value]
+
+    def _read_remote_pointer(self, hProcess, address: int) -> int:
+        """Read a 64-bit pointer from remote process memory."""
+        data = self._read_remote_mem(hProcess, address, 8)
+        if len(data) < 8:
+            return 0
+        return struct.unpack('<Q', data)[0]
+
+    def _read_remote_unicode_string(self, hProcess, us_address: int) -> str:
+        """Read a UNICODE_STRING from a remote process."""
+        # UNICODE_STRING: USHORT Length, USHORT MaximumLength, 4-byte pad, PWSTR Buffer
+        us_data = self._read_remote_mem(hProcess, us_address, _US_SIZE)
+        if len(us_data) < _US_SIZE:
+            return ""
+        length = struct.unpack('<H', us_data[0:2])[0]      # byte length
+        buf_ptr = struct.unpack('<Q', us_data[8:16])[0]     # buffer pointer
+        if length == 0 or buf_ptr == 0:
+            return ""
+        raw = self._read_remote_mem(hProcess, buf_ptr, length)
+        if not raw:
+            return ""
+        return raw.decode('utf-16-le', errors='replace').rstrip('\x00')
+
+    def _read_remote_environment(self, hProcess, env_ptr: int) -> dict:
+        """Read environment block from remote process. Returns dict of relevant vars."""
+        if not env_ptr:
+            return {}
+        # Read up to 64KB, scan for double-null
+        raw = self._read_remote_mem(hProcess, env_ptr, 0x10000)
+        if not raw:
+            return {}
+        # Find double-null terminator (UTF-16)
+        end = len(raw)
+        i = 0
+        while i < len(raw) - 3:
+            if raw[i:i+4] == b'\x00\x00\x00\x00':
+                end = i + 4
+                break
+            i += 2
+        text = raw[:end].decode('utf-16-le', errors='replace')
+        env_vars = [v for v in text.split('\x00') if v and '=' in v]
+        result = {}
+        for var in env_vars:
+            name, _, value = var.partition('=')
+            result[name.upper()] = value
+        return result
+
+    def _clone_from_pid(self, pid: int) -> dict:
+        """Open a remote process and read its PEB identity markers."""
+        hProcess = self._OpenProcess(
+            _PROCESS_QUERY_INFORMATION | _PROCESS_VM_READ, False, pid
+        )
+        h_int = hProcess if isinstance(hProcess, int) else ctypes.cast(hProcess, ctypes.c_void_p).value or 0
+        if not h_int:
+            logging.debug(f"IdentityCloak: cannot open PID {pid} (access denied)")
+            return {}
+
+        try:
+            # Get remote PEB address via NtQueryInformationProcess
+            pbi = PROCESS_BASIC_INFORMATION()
+            ret_len = wintypes.ULONG()
+            status = self._NtQueryInformationProcess(
+                h_int, 0, ctypes.byref(pbi), ctypes.sizeof(pbi), ctypes.byref(ret_len)
+            )
+            if status != 0:
+                logging.debug(f"IdentityCloak: NtQueryInformationProcess failed for PID {pid}: 0x{status & 0xFFFFFFFF:X}")
+                return {}
+
+            peb_addr = ctypes.cast(pbi.PebBaseAddress, ctypes.c_void_p).value
+            if not peb_addr:
+                return {}
+
+            # Read ProcessParameters pointer from PEB
+            pp_addr = self._read_remote_pointer(h_int, peb_addr + _PP_OFFSET_IN_PEB)
+            if not pp_addr:
+                logging.debug(f"IdentityCloak: ProcessParameters is NULL for PID {pid}")
+                return {}
+
+            # Read identity markers
+            cmd_line   = self._read_remote_unicode_string(h_int, pp_addr + _CMD_OFFSET_IN_PP)
+            image_path = self._read_remote_unicode_string(h_int, pp_addr + _IMGPATH_OFFSET_IN_PP)
+            cur_dir    = self._read_remote_unicode_string(h_int, pp_addr + _CURDIR_OFFSET_IN_PP)
+
+            # Read environment
+            env_ptr = self._read_remote_pointer(h_int, pp_addr + _ENV_OFFSET_IN_PP)
+            env_dict = self._read_remote_environment(h_int, env_ptr)
+
+            config = {}
+            if cmd_line:
+                config["command_line"] = cmd_line
+            if image_path:
+                config["image_path"] = image_path
+            if cur_dir:
+                config["current_dir"] = cur_dir
+            if "USERNAME" in env_dict:
+                config["env_username"] = env_dict["USERNAME"]
+            if "USERDOMAIN" in env_dict:
+                config["env_userdomain"] = env_dict["USERDOMAIN"]
+
+            logging.info(f"  Cloned identity from PID {pid}:")
+            if cmd_line:
+                logging.info(f"    CommandLine: {cmd_line[:80]}{'...' if len(cmd_line) > 80 else ''}")
+            if image_path:
+                logging.info(f"    ImagePath:   {image_path}")
+            if cur_dir:
+                logging.info(f"    CurrentDir:  {cur_dir}")
+            if "USERNAME" in env_dict:
+                logging.info(f"    USERNAME:    {env_dict['USERNAME']}")
+            if "USERDOMAIN" in env_dict:
+                logging.info(f"    USERDOMAIN:  {env_dict['USERDOMAIN']}")
+
+            return config
+
+        finally:
+            self._CloseHandle(h_int)
+
+    def _resolve_config(self):
+        """
+        Build the cloak config. Priority:
+          1. custom_config (explicit values, no enumeration)
+          2. Live clone from target_name (enumerate, pick, read PEB)
+        """
+        # Explicit custom values — skip enumeration entirely
+        if self.custom_config:
+            self.config = {k: v for k, v in self.custom_config.items() if v is not None}
+            if self.config:
+                logging.info("  Using custom cloak config (no enumeration)")
+                return True
+
+        if not self.target_name:
+            return False
+
+        # Live enumeration
+        self._resolve_enum_apis()
+        pids = self._find_target_pids(self.target_name)
+
+        if not pids:
+            logging.warning(f"IdentityCloak: no running instances of '{self.target_name}' found")
+            return False
+
+        logging.info(f"  Found {len(pids)} instance(s) of {self.target_name}: {pids[:10]}{'...' if len(pids) > 10 else ''}")
+
+        # Try each PID until we get a successful read
+        # Shuffle to avoid always picking the same one
+        random.shuffle(pids)
+        for pid in pids:
+            config = self._clone_from_pid(pid)
+            if config:
+                self.config = config
+                return True
+            # If we can't read this one (access denied, etc.), try next
+
+        logging.warning(f"IdentityCloak: could not read PEB from any {self.target_name} instance")
+        return False
+
+    # ------------------------------------------------------------------
+    # PEB writing (applies cloned values to our own process)
+    # ------------------------------------------------------------------
+
+    def _resolve_write_apis(self):
+        resolver = get_stealth_resolver()
+        va = resolver.get_proc_address("kernel32.dll", "VirtualAlloc")
+        vf = resolver.get_proc_address("kernel32.dll", "VirtualFree")
+        if not va or not vf:
+            raise RuntimeError("IdentityCloak: failed to resolve VirtualAlloc/VirtualFree")
+        self._VirtualAlloc = ctypes.WINFUNCTYPE(
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.c_ulong
+        )(va)
+        self._VirtualFree = ctypes.WINFUNCTYPE(
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong
+        )(vf)
+
+    def _get_peb(self):
+        if self._peb_ptr is not None:
+            return self._peb_ptr
+        resolver = get_stealth_resolver()
+        if hasattr(resolver, '_peb') and resolver._peb is not None:
+            self._peb_ptr = ctypes.pointer(resolver._peb)
+            return self._peb_ptr
+        raise RuntimeError("IdentityCloak: cannot access PEB")
+
+    def _get_params_addr(self):
+        if self._params_addr is not None:
+            return self._params_addr
+        peb = self._get_peb()
+        val = ctypes.cast(peb.contents.ProcessParameters, ctypes.c_void_p).value
+        if not val:
+            raise RuntimeError("IdentityCloak: ProcessParameters is NULL")
+        self._params_addr = val
+        return val
+
+    def _alloc_wide(self, text: str) -> int:
+        raw = (text + '\x00').encode('utf-16-le')
+        buf = self._VirtualAlloc(None, len(raw), 0x3000, 0x04)
+        if not buf:
+            raise RuntimeError(f"VirtualAlloc failed ({len(raw)} bytes)")
+        addr = buf if isinstance(buf, int) else ctypes.cast(buf, ctypes.c_void_p).value
+        ctypes.memmove(addr, raw, len(raw))
+        self._alloc_buffers.append(addr)
+        return addr
+
+    @staticmethod
+    def _save_us(us) -> tuple:
+        return (us.Length, us.MaximumLength, us.Buffer)
+
+    def _write_us(self, us, text: str):
+        addr = self._alloc_wide(text)
+        char_count = len(text)
+        us.Buffer = ctypes.cast(addr, wintypes.LPWSTR)
+        us.Length = ctypes.c_ushort(char_count * 2)
+        us.MaximumLength = ctypes.c_ushort((char_count + 1) * 2)
+
+    def _modify_environment(self, params_addr: int, username: str = None, userdomain: str = None):
+        if username is None and userdomain is None:
+            return
+
+        env_ptr_loc = params_addr + _ENV_OFFSET_IN_PP
+        env_ptr = ctypes.c_void_p.from_address(env_ptr_loc).value
+        if not env_ptr:
+            logging.warning("IdentityCloak: Environment pointer is NULL")
+            return
+
+        self._orig_env_ptr = env_ptr
+
+        max_scan = 0x10000
+        raw = bytes((ctypes.c_char * max_scan).from_address(env_ptr))
+        end = max_scan
+        i = 0
+        while i < len(raw) - 3:
+            if raw[i:i+4] == b'\x00\x00\x00\x00':
+                end = i + 4
+                break
+            i += 2
+
+        env_text = raw[:end].decode('utf-16-le', errors='replace')
+        env_vars = [v for v in env_text.split('\x00') if v]
+
+        new_vars = []
+        for var in env_vars:
+            if '=' not in var:
+                new_vars.append(var)
+                continue
+            name, _, value = var.partition('=')
+            if username is not None and name.upper() == 'USERNAME':
+                new_vars.append(f"USERNAME={username}")
+            elif userdomain is not None and name.upper() == 'USERDOMAIN':
+                new_vars.append(f"USERDOMAIN={userdomain}")
+            else:
+                new_vars.append(var)
+
+        new_block = ('\x00'.join(new_vars) + '\x00\x00').encode('utf-16-le')
+        buf = self._VirtualAlloc(None, len(new_block), 0x3000, 0x04)
+        if not buf:
+            logging.warning("IdentityCloak: failed to allocate environment block")
+            return
+        addr = buf if isinstance(buf, int) else ctypes.cast(buf, ctypes.c_void_p).value
+        ctypes.memmove(addr, new_block, len(new_block))
+        self._alloc_buffers.append(addr)
+        ctypes.c_void_p.from_address(env_ptr_loc).value = addr
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def apply(self):
+        """Enumerate target, clone its PEB, apply to our process."""
+        logging.info("=" * 50)
+        logging.info("IDENTITY CLOAK: LIVE CLONE")
+        logging.info("=" * 50)
+
+        try:
+            # Phase 1: figure out what to clone
+            if not self._resolve_config():
+                logging.warning("  Cloak aborted — no identity to clone.")
+                return
+
+            # Phase 2: write cloned values into our own PEB
+            self._resolve_write_apis()
+            peb = self._get_peb()
+            params = peb.contents.ProcessParameters.contents
+            params_addr = self._get_params_addr()
+
+            if self.config.get("command_line"):
+                self._orig_command_line = self._save_us(params.CommandLine)
+                self._write_us(params.CommandLine, self.config["command_line"])
+                logging.info(f"  CommandLine -> {self.config['command_line'][:72]}{'...' if len(self.config['command_line']) > 72 else ''}")
+
+            if self.config.get("image_path"):
+                self._orig_image_path = self._save_us(params.ImagePathName)
+                self._write_us(params.ImagePathName, self.config["image_path"])
+                logging.info(f"  ImagePath   -> {self.config['image_path']}")
+
+            if self.config.get("current_dir"):
+                self._orig_current_dir = self._save_us(params.CurrentDirectory.DosPath)
+                self._write_us(params.CurrentDirectory.DosPath, self.config["current_dir"])
+                logging.info(f"  CurrentDir  -> {self.config['current_dir']}")
+
+            eu = self.config.get("env_username")
+            ed = self.config.get("env_userdomain")
+            if eu is not None or ed is not None:
+                self._modify_environment(params_addr, eu, ed)
+                if eu:
+                    logging.info(f"  USERNAME    -> {eu}")
+                if ed:
+                    logging.info(f"  USERDOMAIN  -> {ed}")
+
+            self.active = True
+            logging.info("  Identity cloak active.")
+            logging.info("=" * 50)
+
+        except Exception as e:
+            logging.error(f"IdentityCloak: failed to apply: {e}")
+
+    def restore(self):
+        """Restore original PEB values. Safe to call multiple times."""
+        if not self.active:
+            return
+        logging.debug("IdentityCloak: restoring original markers")
+
+        try:
+            peb = self._get_peb()
+            params = peb.contents.ProcessParameters.contents
+            params_addr = self._get_params_addr()
+
+            if self._orig_command_line:
+                params.CommandLine.Length, params.CommandLine.MaximumLength, params.CommandLine.Buffer = self._orig_command_line
+            if self._orig_image_path:
+                params.ImagePathName.Length, params.ImagePathName.MaximumLength, params.ImagePathName.Buffer = self._orig_image_path
+            if self._orig_current_dir:
+                cd = params.CurrentDirectory.DosPath
+                cd.Length, cd.MaximumLength, cd.Buffer = self._orig_current_dir
+            if self._orig_env_ptr is not None:
+                env_ptr_loc = params_addr + _ENV_OFFSET_IN_PP
+                ctypes.c_void_p.from_address(env_ptr_loc).value = self._orig_env_ptr
+        except Exception as e:
+            logging.debug(f"IdentityCloak: restore failed (non-critical): {e}")
+
+        if self._VirtualFree:
+            for buf in self._alloc_buffers:
+                try:
+                    self._VirtualFree(ctypes.c_void_p(buf), 0, 0x8000)
+                except:
+                    pass
+        self._alloc_buffers.clear()
+        self.active = False
+
+# ==============================================================================
 # Memory Substrate - Fileless Execution Framework
 # ==============================================================================
 
@@ -942,7 +1441,7 @@ class VeriductNativeLoader:
     Native binary loader for PE and ELF.
     Implements dynamic linking, relocation, and execution transfer in pure Python.
     """
-    def __init__(self, raw_data_stream: bytearray, command_line: str = None):
+    def __init__(self, raw_data_stream: bytearray, command_line: str = None, cloak_preset: str = None, cloak_custom: dict = None):
         self.stream = raw_data_stream
         self.is_valid = False
         self.entry_point = 0
@@ -954,6 +1453,8 @@ class VeriductNativeLoader:
         self.load_config_rva = 0
         self.load_config_size = 0
         self.command_line = command_line  # Command line to pass to PE
+        self.cloak_preset = cloak_preset
+        self.cloak_custom = cloak_custom
         
         # Track all VirtualAlloc allocations for cleanup (prevents memory leaks)
         self._allocations = []
@@ -1207,6 +1708,15 @@ class VeriductNativeLoader:
         
                 # CRT Initialization (while memory is still RW)
                 crt_init.initialize()
+
+                # Identity Cloak (optional runtime masquerade)
+                identity_cloak = None
+                if self.cloak_preset or self.cloak_custom:
+                    identity_cloak = IdentityCloak(
+                        target_name=self.cloak_preset if self.cloak_preset != "custom" else None,
+                        custom_config=self.cloak_custom
+                    )
+                    identity_cloak.apply()
                 
                 # NOW apply final section protections (two-pass: was RW, now set proper perms)
                 # This happens AFTER all writes are complete (imports resolved, relocations applied, CRT init done)
@@ -1303,6 +1813,11 @@ class VeriductNativeLoader:
                     logging.info(f"PE thread exited with code: {result}")
 
                 # Restore CRT state (might fail if PEB was corrupted, that's ok)
+                if identity_cloak:
+                    try:
+                        identity_cloak.restore()
+                    except:
+                        pass
                 try:
                     crt_init.restore()
                 except:
@@ -1320,6 +1835,11 @@ class VeriductNativeLoader:
                 return result
             
             except Exception as e:
+                if identity_cloak:
+                    try:
+                        identity_cloak.restore()
+                    except:
+                        pass
                 try:
                     crt_init.restore()
                 except:
@@ -2544,7 +3064,7 @@ class VeriductExecutionCore:
     Unified execution core supporting Python bytecode and native binaries.
     Handles streaming reconstruction and format-specific execution.
     """
-    def __init__(self, original_file_extension: str, original_header: bytes = b'', wipe_size: int = 0, command_line: str = None):
+    def __init__(self, original_file_extension: str, original_header: bytes = b'', wipe_size: int = 0, command_line: str = None, cloak_preset: str = None, cloak_custom: dict = None):
         self.file_ext = original_file_extension.lower()
         self.byte_count = 0
         self.bytecode_stream = bytearray()
@@ -2552,6 +3072,8 @@ class VeriductExecutionCore:
         self.wipe_size = wipe_size
         self.memory = MemorySubstrate()
         self.command_line = command_line  # Command line args to pass to PE
+        self.cloak_preset = cloak_preset
+        self.cloak_custom = cloak_custom
         logging.info(f"VeriductExecutionCore initialized for: {self.file_ext}")
 
     def process_instruction_chunk(self, plaintext_chunk: bytes) -> bool:
@@ -2592,7 +3114,7 @@ class VeriductExecutionCore:
         if command_line:
             logging.info(f"Command line: {command_line}")
         
-        loader = VeriductNativeLoader(data, command_line=command_line)
+        loader = VeriductNativeLoader(data, command_line=command_line, cloak_preset=self.cloak_preset, cloak_custom=self.cloak_custom)
         loader.parse_headers()
         
         if loader.is_valid:
@@ -3031,7 +3553,9 @@ def run_annihilated_path(
     ignore_integrity: bool = False,
     verbose: bool = False,
     command_line: str = None,
-    target_file: str = None
+    target_file: str = None,
+    cloak_preset: str = None,
+    cloak_custom: dict = None
 ) -> int:
     """
     Execute annihilated files directly from chunks without reassembly.
@@ -3111,7 +3635,7 @@ def run_annihilated_path(
                 logging.info(f"Command line: {full_command_line}")
 
             # Initialize execution core with command line
-            vm = VeriductExecutionCore(file_ext, original_header, wipe_size, command_line=full_command_line)
+            vm = VeriductExecutionCore(file_ext, original_header, wipe_size, command_line=full_command_line, cloak_preset=cloak_preset, cloak_custom=cloak_custom)
 
             # Initialize disentangler if needed
             disentangler = StreamingDisentangler(entanglement_info) if entanglement_info else None
@@ -3513,6 +4037,21 @@ def main():
         "--verbose", action="store_true",
         help="Enable verbose logging"
     )
+    run_parser.add_argument(
+        "--cloak", type=str, default=None,
+        help="Clone identity from a live process (e.g. svchost, RuntimeBroker, dllhost). "
+             "Reads real PEB values from a running instance. Use 'custom' for explicit values."
+    )
+    run_parser.add_argument("--cloak-cmd", type=str, default=None,
+        help="Custom command line (with --cloak custom)")
+    run_parser.add_argument("--cloak-image", type=str, default=None,
+        help="Custom image path (with --cloak custom)")
+    run_parser.add_argument("--cloak-dir", type=str, default=None,
+        help="Custom current directory (with --cloak custom)")
+    run_parser.add_argument("--cloak-user", type=str, default=None,
+        help="Custom USERNAME env var (with --cloak custom)")
+    run_parser.add_argument("--cloak-domain", type=str, default=None,
+        help="Custom USERDOMAIN env var (with --cloak custom)")
 
     # Parse arguments
     args = parser.parse_args()
@@ -3608,11 +4147,32 @@ def main():
             logging.info("Supports: Python (.pyc/.py), PE (.exe/.dll), ELF")
             logging.info("=" * 60)
 
+            # Build cloak config
+            cloak_preset = getattr(args, 'cloak', None)
+            cloak_custom = None
+            if cloak_preset == "custom":
+                cloak_custom = {}
+                if args.cloak_cmd:
+                    cloak_custom["command_line"] = args.cloak_cmd
+                if args.cloak_image:
+                    cloak_custom["image_path"] = args.cloak_image
+                if args.cloak_dir:
+                    cloak_custom["current_dir"] = args.cloak_dir
+                if args.cloak_user:
+                    cloak_custom["env_username"] = args.cloak_user
+                if args.cloak_domain:
+                    cloak_custom["env_userdomain"] = args.cloak_domain
+
+            if cloak_preset:
+                logging.info(f"Identity Cloak: {cloak_preset}")
+
             return run_annihilated_path(
                 key_path=args.key_path,
                 disguise=args.disguise,
                 ignore_integrity=args.ignore_integrity,
-                verbose=args.verbose
+                verbose=args.verbose,
+                cloak_preset=cloak_preset,
+                cloak_custom=cloak_custom
             )
 
         else:

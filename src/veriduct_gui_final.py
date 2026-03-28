@@ -429,6 +429,12 @@ class VeriductGUI:
         
         self.run_verbose_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(options_frame, text="Verbose Output", variable=self.run_verbose_var).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=3)
+
+        ttk.Label(options_frame, text="Identity Cloak:").grid(row=3, column=0, sticky=tk.W, pady=3)
+        self.run_cloak = ttk.Entry(options_frame, width=20)
+        self.run_cloak.grid(row=3, column=1, sticky=tk.W, pady=3, padx=5)
+        ttk.Label(options_frame, text="Process name to clone (e.g. svchost, RuntimeBroker) or leave empty",
+                 foreground='#888', font=('Helvetica', 8)).grid(row=3, column=2, padx=5, sticky=tk.W)
         
         # Warning
         warning_frame = ttk.Frame(tab)
@@ -652,6 +658,9 @@ class VeriductGUI:
         # Get arguments
         args = self.run_args.get().strip() if self.run_args.get().strip() else None
         
+        # Get cloak target
+        cloak_target = self.run_cloak.get().strip() if self.run_cloak.get().strip() else None
+        
         def operation():
             try:
                 veriduct_prime.run_annihilated_path(
@@ -659,7 +668,8 @@ class VeriductGUI:
                     disguise=disguise,
                     ignore_integrity=self.run_ignore_integrity_var.get(),
                     verbose=self.run_verbose_var.get(),
-                    command_line=args
+                    command_line=args,
+                    cloak_preset=cloak_target
                 )
                 self.root.after(0, lambda: self._set_running(False))
                 
