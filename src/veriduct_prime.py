@@ -25,7 +25,7 @@ Native Loader Capabilities:
 - ELF: Section header parsing, dynamic linking, shared library loading, RELA/REL relocations
 - Memory management and cleanup
 
-Version: 2.2 (Identity Cloak - Live Process Clone)
+Version: 2.5 (Identity Cloak - Live Process Clone)
 """
 
 import os
