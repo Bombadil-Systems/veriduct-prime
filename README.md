@@ -1,6 +1,6 @@
 # Veriduct Prime
 
-**Format Destruction Framework for Binary Evasion**
+**Format Destruction Framework for Binary Manipulation**
 
 Veriduct destroys executable file formats into unrecognizable chunks, then executes them directly from memory without ever writing a file to disk. Security tools can't detect what doesn't exist.
 
@@ -47,6 +47,9 @@ python src/veriduct_prime.py annihilate payload.exe output/ --ssm --verbose
 # Execute from chunks (no file written)
 python src/veriduct_prime.py run output/veriduct_key.zst --verbose
 
+# Execute disguised as svchost
+python src/veriduct_prime.py run output/veriduct_key.zst --cloak svchost --verbose
+
 # Or verify reconstruction integrity
 python src/veriduct_prime.py reassemble output/veriduct_key.zst rebuilt/
 sha256sum payload.exe rebuilt/payload.exe  # Identical
@@ -74,9 +77,27 @@ The native loader streams chunks from the database and builds the executable in 
 4. Resolve imports via hash-based lookup (no string references in memory)
 5. Process TLS callbacks
 6. Register SEH handlers (x64)
-7. Jump to entry point
+7. Apply Identity Cloak (if enabled) — clone PEB markers from a live process
+8. Jump to entry point
 
 No file is written. The executable exists only in allocated memory pages.
+
+### Identity Cloak
+
+New in v2.2. At runtime, Veriduct can masquerade as another process by cloning PEB identity markers from a real running instance of the target.
+
+Rather than hardcoding fake strings, the cloak enumerates live processes via Toolhelp32, opens a matching instance with `ReadProcessMemory`, and copies its actual PEB values onto the current process. The disguise is an exact replica of something already on the box.
+
+**What it clones (user-mode, PEB-level — assumed by most tools, not kernel-verified):**
+- `CommandLine`
+- `ImagePathName`
+- `CurrentDirectory`
+- Environment variables (`USERNAME`, `USERDOMAIN`)
+
+**What it cannot modify (kernel-enforced):**
+- Token SID, Integrity Level, Session ID, `EPROCESS.ImageFileName`
+
+All API resolution goes through `StealthResolver` — no `ctypes.windll` calls during cloak setup. Allocated buffers are tracked and freed on restore.
 
 ### Technical Implementation
 
@@ -149,6 +170,7 @@ Reassembled:         58/72 detections (proves byte-perfect reconstruction)
 - TLS callbacks
 - SEH registration (RtlAddFunctionTable)
 - DLL dependency loading
+- Identity Cloak (live PEB clone from running processes)
 
 ### Linux ELF — Functional
 - Program header loading
@@ -175,6 +197,33 @@ python src/veriduct_prime.py annihilate binary.exe out/ \
 --disguise config # Looks like INI configuration
 ```
 
+### Identity Cloak
+
+```bash
+# Clone identity from a live svchost instance
+python src/veriduct_prime.py run keymap.zst --cloak svchost
+
+# Clone from RuntimeBroker, dllhost, or any running process
+python src/veriduct_prime.py run keymap.zst --cloak RuntimeBroker
+
+# Explicit custom identity (no enumeration)
+python src/veriduct_prime.py run keymap.zst --cloak custom \
+    --cloak-cmd "C:\Windows\system32\svchost.exe -k netsvcs -p" \
+    --cloak-image "C:\Windows\system32\svchost.exe" \
+    --cloak-dir "C:\Windows\system32" \
+    --cloak-user "SYSTEM" \
+    --cloak-domain "NT AUTHORITY"
+```
+
+| Flag | Description |
+|------|-------------|
+| `--cloak <name>` | Clone PEB from a live process (e.g. `svchost`, `RuntimeBroker`). Use `custom` for explicit values. |
+| `--cloak-cmd` | Custom CommandLine (requires `--cloak custom`) |
+| `--cloak-image` | Custom ImagePathName (requires `--cloak custom`) |
+| `--cloak-dir` | Custom CurrentDirectory (requires `--cloak custom`) |
+| `--cloak-user` | Custom USERNAME env var (requires `--cloak custom`) |
+| `--cloak-domain` | Custom USERDOMAIN env var (requires `--cloak custom`) |
+
 ## Included Demo
 
 The repository includes a proof-of-concept C2 agent demonstrating practical application:
@@ -196,6 +245,7 @@ Features HTTP beaconing, command execution, and file transfer. Intended as a dem
 - **DLL Standalone**: DLLs require a host process (by design)
 - **Self-modifying Code**: Binaries that modify their own code sections may fail
 - **.NET/Managed**: CLR executables not supported (native code only)
+- **Identity Cloak**: Only modifies user-mode PEB markers; kernel-level identity (`EPROCESS.ImageFileName`, token SID, integrity level) is not affected — tools that query the kernel will still see the real process identity
 
 See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for details.
 
@@ -207,12 +257,13 @@ See [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for details.
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Technical deep-dive |
 | [docs/API.md](docs/API.md) | API reference |
 | [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) | Current limitations |
+| [CHANGELOG.md](CHANGELOG.md) | Version history |
 
 ## Background
 
 Veriduct emerged from ransomware defense research. While developing file blueprint reconstruction techniques to recover encrypted files, the inverse became apparent: if file formats can be perfectly reconstructed from fragments, they can also be perfectly destructed into fragments. Veriduct applies that insight offensively.
 
-Presented at DEF CON DC862.
+Presented at DEF CON DC862 and BSidesROC 2026.
 
 ## Requirements
 
