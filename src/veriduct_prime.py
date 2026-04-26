@@ -25,7 +25,7 @@ Native Loader Capabilities:
 - ELF: Section header parsing, dynamic linking, shared library loading, RELA/REL relocations
 - Memory management and cleanup
 
-Version: 2.6 (CFG-Safe Gadgets + Module Stomping)
+Version: 2.5.3 (CFG-Safe Gadgets + Module Stomping)
 """
 
 import os
