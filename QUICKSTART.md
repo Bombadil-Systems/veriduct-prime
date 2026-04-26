@@ -5,7 +5,7 @@ Get format destruction working in 5 minutes.
 ## Prerequisites
 
 - Python 3.8 or higher
-- Windows 10/11 (for PE semantic execution) or Linux (for ELF)
+- Windows 10/11 (for PE semantic execution) or Linux kernel 3.19+ (for ELF)
 - ~50MB disk space
 
 ## Installation
@@ -49,19 +49,19 @@ python src/veriduct_prime.py annihilate C:\Windows\System32\calc.exe output/ --v
 
 Expected output:
 ```
-2025-12-15 12:00:00 [INFO] ============================================================
-2025-12-15 12:00:00 [INFO] VERIDUCT PRIME - FORMAT DESTRUCTION
-2025-12-15 12:00:00 [INFO] ============================================================
-2025-12-15 12:00:00 [INFO] Processing: C:\Windows\System32\calc.exe
-2025-12-15 12:00:00 [INFO] File size: 27,648 bytes
-2025-12-15 12:00:00 [INFO] Chunking with base size: 4096 bytes
-2025-12-15 12:00:00 [INFO] Created 7 chunks
-2025-12-15 12:00:00 [INFO] Stored 7 chunks to database
-2025-12-15 12:00:00 [INFO] Keymap written to: output/veriduct_key.zst
-2025-12-15 12:00:00 [INFO] Chunks DB written to: output/veriduct_chunks.db
-2025-12-15 12:00:00 [INFO] ============================================================
-2025-12-15 12:00:00 [INFO] ANNIHILATION COMPLETE
-2025-12-15 12:00:00 [INFO] ============================================================
+2026-04-26 12:00:00 [INFO] ============================================================
+2026-04-26 12:00:00 [INFO] VERIDUCT PRIME - FORMAT DESTRUCTION
+2026-04-26 12:00:00 [INFO] ============================================================
+2026-04-26 12:00:00 [INFO] Processing: C:\Windows\System32\calc.exe
+2026-04-26 12:00:00 [INFO] File size: 27,648 bytes
+2026-04-26 12:00:00 [INFO] Chunking with base size: 4096 bytes
+2026-04-26 12:00:00 [INFO] Created 7 chunks
+2026-04-26 12:00:00 [INFO] Stored 7 chunks to database
+2026-04-26 12:00:00 [INFO] Keymap written to: output/veriduct_key.zst
+2026-04-26 12:00:00 [INFO] Chunks DB written to: output/veriduct_chunks.db
+2026-04-26 12:00:00 [INFO] ============================================================
+2026-04-26 12:00:00 [INFO] ANNIHILATION COMPLETE
+2026-04-26 12:00:00 [INFO] ============================================================
 ```
 
 **What happened:**
@@ -89,17 +89,17 @@ sha256sum /path/to/original rebuilt/calc.exe
 
 Expected output:
 ```
-2025-12-15 12:00:05 [INFO] ============================================================
-2025-12-15 12:00:05 [INFO] VERIDUCT REASSEMBLY
-2025-12-15 12:00:05 [INFO] ============================================================
-2025-12-15 12:00:05 [INFO] Loading keymap: output/veriduct_key.zst
-2025-12-15 12:00:05 [INFO] Reassembling: calc.exe
-2025-12-15 12:00:05 [INFO] Retrieved 7 chunks
-2025-12-15 12:00:05 [INFO] File reassembled: rebuilt/calc.exe (27,648 bytes)
-2025-12-15 12:00:05 [INFO] Integrity check: PASSED ✓
-2025-12-15 12:00:05 [INFO] ============================================================
-2025-12-15 12:00:05 [INFO] REASSEMBLY COMPLETE
-2025-12-15 12:00:05 [INFO] ============================================================
+2026-04-26 12:00:05 [INFO] ============================================================
+2026-04-26 12:00:05 [INFO] VERIDUCT REASSEMBLY
+2026-04-26 12:00:05 [INFO] ============================================================
+2026-04-26 12:00:05 [INFO] Loading keymap: output/veriduct_key.zst
+2026-04-26 12:00:05 [INFO] Reassembling: calc.exe
+2026-04-26 12:00:05 [INFO] Retrieved 7 chunks
+2026-04-26 12:00:05 [INFO] File reassembled: rebuilt/calc.exe (27,648 bytes)
+2026-04-26 12:00:05 [INFO] Integrity check: PASSED ✓
+2026-04-26 12:00:05 [INFO] ============================================================
+2026-04-26 12:00:05 [INFO] REASSEMBLY COMPLETE
+2026-04-26 12:00:05 [INFO] ============================================================
 ```
 
 **The hashes will be identical.** This proves byte-perfect reconstruction.
@@ -118,31 +118,34 @@ python src/veriduct_prime.py run output/veriduct_key.zst --verbose
 
 Expected output:
 ```
-2025-12-15 12:00:10 [INFO] ============================================================
-2025-12-15 12:00:10 [INFO] VERIDUCT SEMANTIC EXECUTION MODE
-2025-12-15 12:00:10 [INFO] Files execute from chunks without disk materialization
-2025-12-15 12:00:10 [INFO] Supports: Python (.pyc/.py), PE (.exe/.dll), ELF
-2025-12-15 12:00:10 [INFO] ============================================================
-2025-12-15 12:00:10 [INFO] Loading keymap: output/veriduct_key.zst
-2025-12-15 12:00:10 [INFO] Streaming chunks to memory...
-2025-12-15 12:00:10 [INFO] Detected PE binary (Windows executable)
-2025-12-15 12:00:10 [INFO] Image base: 0x140000000
-2025-12-15 12:00:10 [INFO] Entry point RVA: 0x1234
-2025-12-15 12:00:10 [INFO] Allocating 65536 bytes for PE image
-2025-12-15 12:00:10 [INFO] Mapping 4 sections...
-2025-12-15 12:00:10 [INFO] Applying relocations (delta: 0x...)
-2025-12-15 12:00:10 [INFO] Resolving imports...
-2025-12-15 12:00:10 [INFO] Loaded 3 DLLs
-2025-12-15 12:00:10 [INFO] Jumping to entry point: 0x...
+2026-04-26 12:00:10 [INFO] ============================================================
+2026-04-26 12:00:10 [INFO] VERIDUCT SEMANTIC EXECUTION MODE
+2026-04-26 12:00:10 [INFO] Files execute from chunks without disk materialization
+2026-04-26 12:00:10 [INFO] Supports: Python (.pyc/.py), PE (.exe/.dll), ELF
+2026-04-26 12:00:10 [INFO] ============================================================
+2026-04-26 12:00:10 [INFO] Loading keymap: output/veriduct_key.zst
+2026-04-26 12:00:10 [INFO] Streaming chunks to memory...
+2026-04-26 12:00:10 [INFO] Detected PE binary (Windows executable)
+2026-04-26 12:00:10 [INFO] SyscallEngine: Ready — 9 SSNs, gadget @ 0x7FF..., spoof targets: 2
+2026-04-26 12:00:10 [INFO] PE Loader: Using INDIRECT SYSCALLS with stack frame spoofing
+2026-04-26 12:00:10 [INFO] Allocated 65536 bytes at 0x... [indirect syscall]
+2026-04-26 12:00:10 [INFO] Mapping 4 sections...
+2026-04-26 12:00:10 [INFO] Applying relocations (delta: 0x...)
+2026-04-26 12:00:10 [INFO] Resolving imports...
+2026-04-26 12:00:10 [INFO] IAT Hook: Redirecting Sleep -> SleepMask @ 0x...
+2026-04-26 12:00:10 [INFO] Loaded 3 DLLs
+2026-04-26 12:00:10 [INFO] Module stomp: thread @ 0x... (version.dll!DllMain+0) [indirect syscall]
+2026-04-26 12:00:10 [INFO] Waiting for PE thread completion...
 [Binary output appears here]
-2025-12-15 12:00:11 [INFO] Entry point returned: 0
+2026-04-26 12:00:11 [INFO] PE thread exited with code: 0
 ```
 
 **What happened:**
 - Binary was streamed from chunks into memory
 - PE headers were parsed
-- Imports were resolved dynamically
-- Entry point was called
+- Imports were resolved dynamically, Sleep/SleepEx hooked for annihilation sleep masking
+- Thread created via module stomping (start address in a signed disk-backed DLL)
+- All memory operations routed through indirect syscalls with spoofed call stacks
 - **No file was ever written to disk**
 
 ## Example 4: Advanced Options
@@ -182,6 +185,23 @@ python src/veriduct_prime.py annihilate target.exe output/ --disguise log
 python src/veriduct_prime.py annihilate target.exe output/ --disguise conf
 ```
 
+### Identity Cloak
+Clone PEB identity from a live process at runtime:
+
+```bash
+# Clone from a running svchost instance
+python src/veriduct_prime.py run output/veriduct_key.zst --cloak svchost
+
+# Clone from RuntimeBroker
+python src/veriduct_prime.py run output/veriduct_key.zst --cloak RuntimeBroker
+
+# Custom identity
+python src/veriduct_prime.py run output/veriduct_key.zst --cloak custom \
+    --cloak-cmd "C:\Windows\System32\svchost.exe -k netsvcs" \
+    --cloak-image "C:\Windows\System32\svchost.exe" \
+    --cloak-dir "C:\Windows\System32"
+```
+
 ### Full Stealth Mode
 Combine all anti-detection features:
 
@@ -194,6 +214,7 @@ python src/veriduct_prime.py annihilate target.exe output/ \
     --variable-chunks \
     --chunk-jitter 0.2 \
     --disguise log \
+    --blob \
     --verbose
 ```
 
@@ -223,21 +244,27 @@ python src/veriduct_prime.py annihilate original.exe fresh_output/ --verbose
 ### PE execution crashes immediately
 
 Check the binary type:
-- **GUI apps** (MessageBox, windows) have limited support — use `reassemble` instead
+- **GUI apps** — basic windowed apps work, but apps needing Common Controls v6 or SxS activation contexts may fail. Use `reassemble` if needed.
 - **DLLs** can't be executed standalone — use `reassemble`
 - **.NET/managed binaries** are not supported
 
-### ELF execution crashes
+### ELF execution issues
 
-The ELF loader has incomplete stack initialization. Use `reassemble` for ELF:
+The primary ELF path uses `memfd_create` + `fork`/`execveat` and handles standard glibc-linked binaries. Requires kernel 3.19+. On older kernels, falls back to direct mmap which only works for `-nostdlib` static binaries.
+
+If the memfd path fails, use `reassemble`:
 ```bash
 python src/veriduct_prime.py reassemble key.zst output/
-./output/mybinary  # Run the reassembled binary
+./output/mybinary
 ```
 
 ### "Failed to resolve import: KERNEL32!SomeFunction"
 
 The binary uses APIs not present on your Windows version. Try on Windows 10/11.
+
+### "SyscallEngine: Init failed"
+
+Indirect syscalls unavailable — execution falls back to standard stealth-resolved API calls automatically. No action needed. This is normal on non-Windows platforms or if ntdll is heavily instrumented.
 
 ## Verification Workflow
 
@@ -267,10 +294,8 @@ sha256sum rebuilt/target.exe
 
 ## Next Steps
 
-- Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for technical details
-- Explore [docs/ADVANCED.md](docs/ADVANCED.md) for SSM, entanglement, poisoning
-- Try the [C2 demo](c2/README.md) for operational validation
-- Review [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for edge cases
+- Read [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md) for edge cases
+- Review [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for technical details
 
 ## Getting Help
 
