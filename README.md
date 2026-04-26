@@ -37,7 +37,7 @@ Traditional evasion transforms the payload. Veriduct eliminates it until the mom
 
 ```bash
 # Clone and install
-git clone https://github.com/bombadil-systems/veriduct-prime.git
+git clone https://github.com/Bombadil-Systems/veriduct-prime.git
 cd veriduct-prime
 pip install -r requirements.txt
 
@@ -72,19 +72,48 @@ Output: A chunk database (SQLite) and a keymap containing reconstruction metadat
 The native loader streams chunks from the database and builds the executable in memory:
 
 1. Parse PE headers from chunk stream
-2. Allocate memory with correct section protections (RX, RW, etc.)
-3. Apply base relocations for ASLR
-4. Resolve imports via hash-based lookup (no string references in memory)
-5. Process TLS callbacks
-6. Register SEH handlers (x64)
-7. Apply Identity Cloak (if enabled) — clone PEB markers from a live process
-8. Jump to entry point
+2. Initialize stealth infrastructure (StealthResolver + SyscallEngine)
+3. Allocate memory via indirect syscall (`NtAllocateVirtualMemory`) with fallback to `VirtualAlloc`
+4. Map sections and apply base relocations for ASLR
+5. Resolve imports via hash-based lookup (no string references in memory)
+6. Hook Sleep/SleepEx IAT entries for annihilation sleep masking
+7. Process TLS callbacks
+8. Register SEH handlers (x64)
+9. CRT initialization (security cookie, PEB.ImageBaseAddress patch)
+10. Apply Identity Cloak (if enabled) — clone PEB markers from a live process
+11. Apply section protections via indirect syscall (`NtProtectVirtualMemory`)
+12. Create thread via module stomping → `NtCreateThreadEx` → `CreateThread` (priority fallback)
+13. Wait, cleanup, restore
 
 No file is written. The executable exists only in allocated memory pages.
 
+### Indirect Syscalls + Stack Spoofing
+
+All critical memory operations (allocation, protection, free, thread creation, wait) route through indirect syscalls when available. The SyscallEngine extracts SSNs from ntdll stubs, locates `syscall;ret` gadgets, and builds two-stage trampolines with spoofed RBP frame chains showing legitimate `kernel32 → ntdll` call ancestry.
+
+If a stub is hooked, Hell's Gate recovery infers the SSN from clean neighboring stubs. Each function gets its own CFG-safe gadget sourced from its stub's code range.
+
+Falls back transparently to stealth-resolved Win32 API calls if the engine can't initialize.
+
+### Annihilation Sleep Mask
+
+When the PE calls `Sleep()` or `SleepEx()`, the IAT hook fires and the PE image is annihilated:
+
+1. Capture the live PE image from memory
+2. Shatter + entangle into chunks via the existing Veriduct pipeline
+3. Free the PE memory region (`MEM_DECOMMIT` — VA reservation survives)
+4. Sleep via `NtDelayExecution` through indirect syscall with stack spoofing
+5. Reconstruct at the same base address, re-apply section protections, resume
+
+The PE does not exist during sleep. Not encrypted, not obfuscated — absent. Chunks live as Python objects in the managed heap, indistinguishable from application data.
+
+### Module Stomping
+
+Thread creation uses module stomping when available: a 12-byte trampoline (`mov rax, <entry>; jmp rax`) is written over the DllMain of an already-loaded benign DLL. The thread's start address is inside a signed, disk-backed module. Original bytes are restored after the thread completes.
+
 ### Identity Cloak
 
-New in v2.2. At runtime, Veriduct can masquerade as another process by cloning PEB identity markers from a real running instance of the target.
+At runtime, Veriduct can masquerade as another process by cloning PEB identity markers from a real running instance of the target.
 
 Rather than hardcoding fake strings, the cloak enumerates live processes via Toolhelp32, opens a matching instance with `ReadProcessMemory`, and copies its actual PEB values onto the current process. The disguise is an exact replica of something already on the box.
 
@@ -111,24 +140,19 @@ hash = 0x7c0017a5  # Pre-computed hash of "CreateFileW"
 addr = resolve_by_hash("kernel32.dll", hash)
 ```
 
-This eliminates string-based detection of suspicious API usage.
+This eliminates string-based detection of suspicious API usage. Export forwarders are resolved recursively.
 
-**Native Syscall Proxying**
+**Indirect Syscall Proxying**
 
-Windows API calls are made through `ctypes` with proper `WINFUNCTYPE` declarations, ensuring correct calling conventions and type marshaling:
+Critical Windows API calls are routed through ntdll `syscall;ret` gadgets via two-stage trampolines. The call never passes through userland hooks:
 
-```python
-CreateFileW = ctypes.WINFUNCTYPE(
-    wintypes.HANDLE,           # Return
-    wintypes.LPCWSTR,          # lpFileName
-    wintypes.DWORD,            # dwDesiredAccess
-    wintypes.DWORD,            # dwShareMode
-    ctypes.c_void_p,           # lpSecurityAttributes
-    wintypes.DWORD,            # dwCreationDisposition
-    wintypes.DWORD,            # dwFlagsAndAttributes
-    wintypes.HANDLE            # hTemplateFile
-)(kernel32.CreateFileW)
 ```
+mov r10, rcx          ; standard syscall setup
+mov eax, <SSN>        ; system service number
+jmp <ntdll_gadget>    ; syscall;ret inside ntdll
+```
+
+RBP frame chain is spoofed to show `BaseThreadInitThunk → RtlUserThreadStart` ancestry. Sleeping/waiting threads have legitimate-looking stacks.
 
 ## Validation
 
@@ -164,19 +188,24 @@ Reassembled:         58/72 detections (proves byte-perfect reconstruction)
 ## Platform Support
 
 ### Windows PE — Production Ready
+- Indirect syscalls with RBP-chain stack spoofing (fallback to stealth-resolved Win32 APIs)
+- Annihilation sleep mask (PE destroyed during sleep, reconstructed on wake)
+- Module stomping for thread creation (thread origin in signed disk-backed DLL)
 - Section mapping with memory protections
 - Base relocation (HIGHLOW, DIR64)
-- Import resolution (hash-based, delay-load)
+- Import resolution (hash-based, delay-load, export forwarder resolution)
 - TLS callbacks
 - SEH registration (RtlAddFunctionTable)
+- CRT initialization (security cookie, PEB patch)
 - DLL dependency loading
 - Identity Cloak (live PEB clone from running processes)
 
-### Linux ELF — Functional
-- Program header loading
-- Dynamic linking (GOT/PLT)
-- RELA/REL relocations
-- Note: Some edge cases use `reassemble` mode for reliability
+### Linux ELF — Production Ready (kernel 3.19+)
+- `memfd_create` + `fork`/`execveat` — kernel handles stack layout, dynamic linking, TLS
+- Fileless — memfd never touches disk
+- Standard glibc-linked binaries work
+- Fallback to direct mmap for old kernels (static `-nostdlib` binaries only)
+- Program header loading, dynamic linking (GOT/PLT), RELA/REL relocations
 
 ## Advanced Usage
 
@@ -241,7 +270,7 @@ Features HTTP beaconing, command execution, and file transfer. Intended as a dem
 
 ## Limitations
 
-- **GUI Applications**: MessageBox and windowed applications have limited support
+- **GUI Applications**: Basic windowed apps work (message loop, GDI). Apps needing Common Controls v6 or SxS activation contexts may have issues.
 - **DLL Standalone**: DLLs require a host process (by design)
 - **Self-modifying Code**: Binaries that modify their own code sections may fail
 - **.NET/Managed**: CLR executables not supported (native code only)
@@ -268,7 +297,7 @@ Presented at DEF CON DC862 and BSidesROC 2026.
 ## Requirements
 
 - Python 3.8+
-- Windows 10/11 (PE execution) or Linux (ELF)
+- Windows 10/11 (PE execution) or Linux kernel 3.19+ (ELF)
 - Dependencies: `zstandard` (optional, falls back to zlib)
 
 ## Legal
@@ -283,4 +312,4 @@ MIT License — See [LICENSE](LICENSE)
 
 - Website: [bombadil.systems](https://bombadil.systems)
 - Research: research@bombadil.systems
-- GitHub: [github.com/bombadil-systems](https://github.com/bombadil-systems)
+- GitHub: [github.com/Bombadil-Systems](https://github.com/Bombadil-Systems)
