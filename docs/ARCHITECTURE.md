@@ -117,6 +117,7 @@ Input Binary
 │          XOR ENTANGLEMENT                   │
 │  - Group chunks (default: 3)                 │
 │  - XOR prefix accumulation                   │
+│  - Seed-derived random padding               │
 │  - Record group info in keymap               │
 │  - Each chunk depends on predecessors        │
 └─────────────────────────────────────────────┘
@@ -213,7 +214,7 @@ Keymap + Chunks DB
 │  - Check magic bytes                         │
 │  - MZ/PE → Windows executable                │
 │  - ELF → Linux executable                    │
-│  - 0x610D0D0A → Python bytecode              │
+│  - .pyc magic → Python bytecode              │
 └─────────────────────────────────────────────┘
      │
      ├─────────────────┬─────────────────┐
@@ -241,49 +242,143 @@ Keymap + Chunks DB
 │     ├─ COFF Header (machine type, section count)                │
 │     └─ Optional Header (image base, entry point, data dirs)     │
 │                                                                 │
-│  2. ALLOCATE MEMORY                                             │
-│     ├─ VirtualAlloc(size_of_image)                             │
-│     ├─ PAGE_EXECUTE_READWRITE initially                         │
-│     └─ Preferred base or relocated                              │
+│  2. INITIALIZE STEALTH INFRASTRUCTURE                           │
+│     ├─ StealthResolver: PEB walk → module list → export tables  │
+│     ├─ SyscallEngine: SSN extraction, syscall;ret gadgets,      │
+│     │   two-stage trampolines with RBP-chain stack spoofing     │
+│     └─ Fallback: standard stealth-resolved Win32 API calls      │
 │                                                                 │
-│  3. MAP SECTIONS                                                │
+│  3. ALLOCATE MEMORY                                             │
+│     ├─ NtAllocateVirtualMemory (indirect syscall)               │
+│     ├─ Fallback: VirtualAlloc (stealth-resolved)                │
+│     └─ PAGE_READWRITE initially                                 │
+│                                                                 │
+│  4. MAP SECTIONS                                                │
 │     ├─ .text → Code                                             │
 │     ├─ .rdata → Read-only data                                  │
 │     ├─ .data → Initialized data                                 │
 │     └─ .bss → Uninitialized data (zero-fill)                   │
 │                                                                 │
-│  4. APPLY RELOCATIONS                                           │
+│  5. APPLY RELOCATIONS                                           │
 │     ├─ Calculate delta (actual_base - preferred_base)           │
 │     ├─ IMAGE_REL_BASED_HIGHLOW (32-bit)                        │
 │     └─ IMAGE_REL_BASED_DIR64 (64-bit)                          │
 │                                                                 │
-│  5. RESOLVE IMPORTS                                             │
+│  6. RESOLVE IMPORTS                                             │
 │     ├─ Walk Import Descriptor Table                             │
-│     ├─ LoadLibraryA(dll_name)                                  │
-│     ├─ GetProcAddress(func_name or ordinal)                     │
-│     └─ Patch Import Address Table (IAT)                         │
+│     ├─ Hash-based resolution via StealthResolver                │
+│     │   (PEB walk + PE export table parsing, no API strings)    │
+│     ├─ Export forwarder resolution (recursive)                  │
+│     ├─ Patch Import Address Table (IAT)                         │
+│     └─ IAT hooks: Sleep/SleepEx → SleepMask callbacks           │
 │                                                                 │
-│  6. RESOLVE DELAY-LOAD IMPORTS                                  │
+│  7. RESOLVE DELAY-LOAD IMPORTS                                  │
 │     ├─ Walk Delay Import Descriptor                             │
 │     └─ Eagerly resolve (same as normal imports)                 │
 │                                                                 │
-│  7. EXECUTE TLS CALLBACKS                                       │
+│  8. EXECUTE TLS CALLBACKS                                       │
 │     ├─ Parse IMAGE_TLS_DIRECTORY                               │
 │     ├─ Walk callback array                                      │
 │     └─ Call each with DLL_PROCESS_ATTACH                        │
 │                                                                 │
-│  8. REGISTER SEH (64-bit)                                       │
+│  9. REGISTER SEH (64-bit)                                       │
 │     ├─ Parse .pdata (Exception Directory)                       │
 │     └─ RtlAddFunctionTable()                                   │
 │                                                                 │
-│  9. APPLY SECTION PROTECTIONS                                   │
-│     ├─ VirtualProtect per section                              │
-│     ├─ .text → PAGE_EXECUTE_READ                               │
-│     └─ .rdata → PAGE_READONLY                                  │
+│  10. CRT INITIALIZATION                                        │
+│      ├─ Security cookie (__security_init_cookie)                │
+│      ├─ PEB.ImageBaseAddress patch                              │
+│      └─ CommandLine patch (if specified)                        │
 │                                                                 │
-│  10. JUMP TO ENTRY POINT                                        │
-│      ├─ EXE: mainCRTStartup()                                  │
-│      └─ DLL: DllMain(hInstance, DLL_PROCESS_ATTACH, NULL)      │
+│  11. IDENTITY CLOAK (optional)                                  │
+│      ├─ Enumerate target process via Toolhelp32                 │
+│      ├─ ReadProcessMemory to clone PEB identity markers         │
+│      │   (CommandLine, ImagePathName, CurrentDirectory, Env)    │
+│      └─ Write cloned values to our own PEB                     │
+│                                                                 │
+│  12. APPLY SECTION PROTECTIONS                                  │
+│      ├─ NtProtectVirtualMemory (indirect syscall)               │
+│      ├─ Fallback: VirtualProtect (stealth-resolved)             │
+│      ├─ .text → PAGE_EXECUTE_READ                               │
+│      └─ .rdata → PAGE_READONLY                                  │
+│                                                                 │
+│  13. EXECUTE                                                    │
+│      ├─ EXE: Isolated thread via module stomping                │
+│      │   ├─ Priority 1: Stomp benign DLL DllMain, create thread │
+│      │   │   from signed disk-backed address (NtCreateThreadEx)  │
+│      │   ├─ Priority 2: NtCreateThreadEx (indirect syscall)     │
+│      │   └─ Priority 3: CreateThread (fallback)                 │
+│      ├─ DLL: DllMain(hInstance, DLL_PROCESS_ATTACH, NULL)      │
+│      └─ Wait + cleanup (handle close, memory free)             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Indirect Syscall Engine
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    SYSCALL ENGINE                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  INITIALIZATION                                                 │
+│  ├─ Scan ntdll .text for syscall;ret (0F 05 C3) gadgets        │
+│  ├─ Extract SSNs from ntdll stubs (mov eax, SSN pattern)       │
+│  ├─ Hell's Gate: recover SSNs from hooked stubs via neighbors  │
+│  ├─ Per-function CFG-safe gadgets from each stub               │
+│  └─ Locate spoof targets (BaseThreadInitThunk, etc.)           │
+│                                                                 │
+│  TWO-STAGE TRAMPOLINE (per function)                            │
+│  ┌──────────────────────────────────────────────┐              │
+│  │ Stage 1: save rbp/r12 → spoof rbp →          │              │
+│  │   [rsp]=stage2 → mov r10,rcx →               │              │
+│  │   mov eax,SSN → jmp ntdll_gadget             │              │
+│  ├──────────────────────────────────────────────┤              │
+│  │ Stage 2: restore rbp → push r12 →             │              │
+│  │   restore r12 → ret                           │              │
+│  ├──────────────────────────────────────────────┤              │
+│  │ Data: saved_rbp | saved_r12 |                 │              │
+│  │   fake_frame_0 (→kernel32) |                  │              │
+│  │   fake_frame_1 (→ntdll)                       │              │
+│  └──────────────────────────────────────────────┘              │
+│                                                                 │
+│  RESULT                                                         │
+│  ├─ Syscall executes from ntdll address space                  │
+│  ├─ Call stack shows kernel32 → ntdll ancestry                 │
+│  └─ Userland hooks bypassed entirely                           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Annihilation Sleep Mask
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    SLEEP MASK CYCLE                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  PE calls Sleep() → IAT hook fires                              │
+│       │                                                         │
+│       ▼                                                         │
+│  1. CAPTURE — ctypes.string_at(pe_base, pe_size)               │
+│       │                                                         │
+│       ▼                                                         │
+│  2. SCATTER — SSM shatter + XOR entangle + chunk                │
+│     Chunks become Python bytearray objects in managed heap      │
+│       │                                                         │
+│       ▼                                                         │
+│  3. FREE — VirtualFree(pe_base, MEM_DECOMMIT)                  │
+│     PE region decommitted. Pages released. VA reserved.         │
+│     Nothing for memory scanners to find.                        │
+│       │                                                         │
+│       ▼                                                         │
+│  4. SLEEP — NtDelayExecution (indirect syscall + stack spoof)   │
+│     PE does not exist in memory during this window.             │
+│       │                                                         │
+│       ▼                                                         │
+│  5. RECONSTRUCT — VirtualAlloc(pe_base, MEM_COMMIT)            │
+│     Disentangle → unshatter → memmove → re-apply protections   │
+│     PE resumes as if Sleep() returned normally.                 │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -295,42 +390,42 @@ Keymap + Chunks DB
 │                     ELF LOADING SEQUENCE                         │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
+│  PRIMARY PATH: memfd_create + fork/execveat (kernel 3.19+)      │
+│                                                                 │
+│  1. CREATE MEMFD                                                │
+│     ├─ memfd_create("veriduct", MFD_CLOEXEC)                   │
+│     └─ Write ELF binary to anonymous fd                         │
+│                                                                 │
+│  2. FORK                                                        │
+│     ├─ Child: execveat(fd, "", argv, envp, AT_EMPTY_PATH)      │
+│     │   Kernel handles: stack layout (argc/argv/envp/auxv),     │
+│     │   dynamic linking, PIE ASLR, TLS, init/fini arrays        │
+│     └─ Parent: waitpid()                                       │
+│                                                                 │
+│  3. RESULT                                                      │
+│     ├─ Standard glibc-linked binaries work correctly            │
+│     ├─ Fileless — memfd never touches disk                      │
+│     └─ Exit code propagated to caller                           │
+│                                                                 │
+│  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  │
+│                                                                 │
+│  FALLBACK PATH: direct mmap (old kernels / -nostdlib only)      │
+│                                                                 │
 │  1. PARSE HEADERS                                               │
 │     ├─ ELF Magic (0x7F 'E' 'L' 'F')                            │
 │     ├─ ELF Header (class, machine, entry point)                 │
 │     ├─ Program Headers (PT_LOAD segments)                       │
 │     └─ Section Headers (for symbols)                            │
 │                                                                 │
-│  2. CALCULATE MEMORY LAYOUT                                     │
-│     ├─ Find min/max virtual addresses                           │
-│     └─ Calculate total size (page-aligned)                      │
-│                                                                 │
-│  3. ALLOCATE MEMORY                                             │
+│  2. ALLOCATE + MAP                                              │
 │     ├─ mmap(MAP_ANONYMOUS | MAP_PRIVATE)                       │
-│     └─ PROT_READ | PROT_WRITE | PROT_EXEC                      │
+│     ├─ Copy PT_LOAD segments, zero BSS                          │
+│     └─ Resolve dynamic section + apply relocations              │
 │                                                                 │
-│  4. MAP PT_LOAD SEGMENTS                                        │
-│     ├─ Copy file data                                           │
-│     └─ Zero BSS (memsz > filesz)                               │
-│                                                                 │
-│  5. PARSE DYNAMIC SECTION                                       │
-│     ├─ DT_NEEDED (shared libraries)                            │
-│     ├─ DT_SYMTAB / DT_STRTAB                                   │
-│     ├─ DT_RELA / DT_REL                                        │
-│     └─ DT_JMPREL (PLT relocations)                             │
-│                                                                 │
-│  6. LOAD DEPENDENCIES                                           │
-│     ├─ ctypes.CDLL(library_name)                               │
-│     └─ Store handles for symbol resolution                      │
-│                                                                 │
-│  7. APPLY RELOCATIONS                                           │
-│     ├─ R_X86_64_RELATIVE (base adjustments)                    │
-│     ├─ R_X86_64_GLOB_DAT (GOT entries)                         │
-│     └─ R_X86_64_JUMP_SLOT (PLT entries)                        │
-│                                                                 │
-│  8. JUMP TO ENTRY POINT                                         │
-│     ├─ _start (for static binaries)                            │
-│     └─ Note: Stack layout incomplete (see limitations)          │
+│  3. EXECUTE                                                     │
+│     ├─ CFUNCTYPE(c_int)(entry_point)                            │
+│     └─ WARNING: glibc _start expects kernel stack layout —      │
+│        only -nostdlib static binaries survive this path          │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -359,26 +454,29 @@ CREATE TABLE chunks (
             "size": 78336,
             "chunks": [
                 {"hash": "chunk_hash_1", "size": 4096},
-                {"hash": "chunk_hash_2", "size": 4096},
-                ...
+                {"hash": "chunk_hash_2", "size": 4096}
             ],
             "ssm": {
                 "enabled": true,
                 "seed": "base64_encoded_seed",
-                "null_positions": [[0, 15, 42], [7, 23], ...]
+                "null_positions": [[0, 15, 42], [7, 23]]
             },
             "entanglement": {
                 "enabled": true,
                 "groups": [
-                    {"idxs": [0,1,2], "maxlen": 4096, "original_lengths": [4096,4096,4096]},
-                    ...
+                    {
+                        "idxs": [0,1,2],
+                        "maxlen": 4096,
+                        "original_lengths": [4096,4096,4096],
+                        "padding_seed": "base64_encoded_seed"
+                    }
                 ]
             }
         }
     ],
     "salt": "base64_encoded_salt",
     "hmac": "signature_for_tamper_detection",
-    "created": "2025-12-15T12:00:00Z",
+    "created": "2026-04-26T12:00:00Z",
     "chunks_db": "veriduct_chunks.db"
 }
 ```
@@ -441,6 +539,7 @@ To recover C3, you need C1, C2, and the entangled value.
 - Chunks become interdependent
 - Single chunk analysis reveals nothing
 - Must have all chunks in group to recover any
+- Padding uses seed-derived random bytes (no frequency artifacts)
 
 ### Substrate Poisoning
 
@@ -455,6 +554,30 @@ Database:     [R1] [F1] [R2] [F2] [R3] [R4]
 - Increases forensic analysis complexity
 - Ratio configurable (default: 25%)
 
+### Annihilation Sleep Mask
+
+```
+During execution:    PE image lives at 0x140000000
+                          │
+                     Sleep() called
+                          │
+                          ▼
+During sleep:        PE image does not exist
+                     Chunks are Python objects in managed heap
+                     Memory scanners find nothing
+                          │
+                     NtDelayExecution returns
+                          │
+                          ▼
+After sleep:         PE image reconstructed at 0x140000000
+                     Execution resumes normally
+```
+
+- Not encrypted, not obfuscated — the PE is genuinely absent from memory
+- Chunks are indistinguishable from normal Python application data
+- Sleep performed via indirect syscall with spoofed call stack
+- Uses MEM_DECOMMIT (VA reservation survives, re-commit guaranteed)
+
 ## Security Considerations
 
 ### What Veriduct Provides
@@ -463,12 +586,13 @@ Database:     [R1] [F1] [R2] [F2] [R3] [R4]
 2. **Fileless execution** — No artifact on disk
 3. **Tamper detection** — HMAC verification
 4. **Perfect reconstruction** — Byte-level integrity
+5. **Runtime stealth** — Indirect syscalls, stack spoofing, sleep mask, identity cloak, module stomping
 
 ### What Veriduct Does NOT Provide
 
 1. **Confidentiality** — Anyone with keymap can reconstruct
 2. **Encryption** — Content is chunked, not encrypted
-3. **Anti-debugging** — No runtime protections
+3. **Kernel-level evasion** — Token SID, integrity level, EPROCESS ImageFileName are kernel-enforced and cannot be modified
 4. **Code signing bypass** — Reconstructed binary is unsigned
 
 ### Operational Security
